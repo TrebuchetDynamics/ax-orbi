@@ -13,11 +13,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 FAKES = ROOT / "tests" / "fakes"
@@ -34,6 +36,7 @@ def load(path: Path, name: str):
 
 
 cli = load(CLI, "ax_orbi_cli")
+agent = load(AGENT, "ax_orbi_agent")
 
 CONFIG = """
 name = "demo"
@@ -147,6 +150,93 @@ class Sandbox:
 
 
 class AgentTests(unittest.TestCase):
+    def test_stop_before_launch_starts_nothing(self):
+        sb = Sandbox(self)
+        sb.request("t-queued")
+        supervisor = agent.Supervisor(sb.state)
+        supervisor.on_signal(signal.SIGINT, None)
+        child = Mock(pid=12345)
+        child.wait.return_value = 0
+        with (patch.dict(os.environ, sb.env),
+              patch.object(agent.subprocess, "Popen", return_value=child) as launch):
+            supervisor.execute("t-queued")
+        self.assertEqual(launch.call_count, 0)
+        self.assertFalse((sb.state / "runs" / "t-queued" / "run.json").exists())
+        self.assertEqual(sb.run_record("t-queued")["status"], "queued")
+
+    def test_stop_during_launch_is_recorded_interrupted(self):
+        sb = Sandbox(self)
+        run_id = "t-launch"
+        sb.request(run_id)
+        supervisor = agent.Supervisor(sb.state)
+        stop_signals = {signal.SIGTERM, signal.SIGINT}
+        for signum in stop_signals:
+            self.addCleanup(signal.signal, signum, signal.getsignal(signum))
+        old_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, stop_signals)
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, old_mask)
+
+        heartbeat_started = threading.Event()
+        heartbeat_mask = set()
+        self.addCleanup(supervisor.stopping.set)
+
+        def heartbeat():
+            heartbeat_mask.update(signal.pthread_sigmask(signal.SIG_BLOCK, ()))
+            heartbeat_started.set()
+            supervisor.stopping.wait(5)
+
+        run_file = sb.state / "runs" / run_id / "run.json"
+        statuses = []
+        write_json = agent.write_json
+
+        def write_and_stop(path, data):
+            write_json(path, data)
+            if path == run_file:
+                statuses.append(agent.read_json(path)["status"])
+                if len(statuses) == 1:
+                    self.assertEqual(data["status"], "running")
+                    self.assertTrue(heartbeat_started.wait(5), "heartbeat did not start")
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+        # serve is normally a process entry point; close its workspace lock ourselves.
+        flock = agent.fcntl.flock
+
+        def lock_workspace(fd, op):
+            self.addCleanup(os.close, fd)
+            flock(fd, op)
+
+        child = Mock(pid=12345)
+        child.poll.return_value = None
+        child.wait.return_value = -signal.SIGTERM
+        with (patch.dict(os.environ, sb.env),
+              patch.object(supervisor, "heartbeat_loop", heartbeat),
+              patch.object(supervisor, "next_request", side_effect=[run_id]),
+              patch.object(agent.fcntl, "flock", lock_workspace),
+              patch.object(agent, "prepare", return_value={"ok": True, "checks": []}),
+              patch.object(agent, "write_json", write_and_stop),
+              patch.object(agent.subprocess, "Popen", return_value=child),
+              patch.object(agent.os, "killpg") as terminate):
+            self.assertEqual(supervisor.serve(), 0)
+
+        record = sb.run_record(run_id)
+        self.assertEqual(record["status"], "interrupted")
+        self.assertEqual(record["signal"], "SIGTERM")
+        self.assertEqual(record["pid"], child.pid)
+        self.assertEqual(record["exitCode"], -signal.SIGTERM)
+        terminate.assert_called_once_with(child.pid, signal.SIGTERM)
+        self.assertNotIn("running", statuses[statuses.index("interrupted"):])
+        self.assertTrue(stop_signals <= heartbeat_mask)
+
+    def test_terminal_record_is_never_downgraded(self):
+        sb = Sandbox(self)
+        run_id = "t-terminal"
+        rdir = sb.state / "runs" / run_id
+        rdir.mkdir(parents=True)
+        for status in agent.TERMINAL:
+            with self.subTest(status=status):
+                agent.write_json(rdir / "run.json", {"id": run_id, "status": status})
+                agent.update_run(sb.state, run_id, status="running")
+                self.assertEqual(agent.load_run(sb.state, run_id)["status"], status)
+
     def test_prepare_does_not_start_a_delivery(self):
         sb = Sandbox(self)
         sb.serve()
