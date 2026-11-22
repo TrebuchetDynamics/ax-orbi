@@ -1,0 +1,43 @@
+#!/bin/sh
+# Stand-in for systemctl inside the AX sandbox.
+#
+# Orbi is built to be scheduled by a systemd user timer. Before every tick it
+# checks that its unit files are installed and, when they are not, installs
+# them and reloads systemd. An AX sandbox has no systemd: the AX runner is
+# PID 1 and a tick runs only when the host asks for one (`ax-orbi run`).
+#
+# This shim lets Orbi's own install step complete, unmodified. It answers the
+# few questions that step asks and schedules nothing. The unit files Orbi
+# writes under ~/.config/systemd/user are inert here.
+#
+# Anything it does not recognise fails loudly, so a new Orbi release that
+# starts to rely on systemd for real shows up in `make verify` instead of
+# being silently faked.
+note() { echo "systemctl (ax-orbi shim, no systemd in this sandbox): $*" >&2; }
+
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  show)
+    # No unit is loaded: every property is empty.
+    exit 0 ;;
+  daemon-reload)
+    note "daemon-reload accepted; nothing to reload"
+    exit 0 ;;
+  enable|disable)
+    note "$* accepted; nothing is scheduled here"
+    exit 0 ;;
+  is-enabled)
+    echo disabled
+    exit 1 ;;
+  is-active)
+    echo inactive
+    exit 3 ;;
+  list-timers)
+    echo "NEXT LEFT LAST PASSED UNIT ACTIVATES"
+    echo
+    echo "0 timers listed."
+    exit 0 ;;
+  *)
+    note "unsupported: $*"
+    exit 1 ;;
+esac

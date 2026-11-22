@@ -18,6 +18,9 @@ commit = "f4a2ef5ab8c33cc4128447457bbb5ca88cc08342"
 package = "@earendil-works/pi-coding-agent"
 version = "1.6.0"
 
+[uv]
+version = "0.13.9"
+
 [gh]
 version = "2.104.0"
 sha256_amd64 = "98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e"

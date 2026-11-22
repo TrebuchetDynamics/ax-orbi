@@ -34,6 +34,7 @@ ARG ORBI_TAG
 ARG ORBI_COMMIT
 ARG PI_PACKAGE
 ARG PI_VERSION
+ARG UV_VERSION
 ARG GH_VERSION
 ARG GH_SHA256_AMD64
 ARG GH_SHA256_ARM64
@@ -67,16 +68,30 @@ RUN npm install -g --ignore-scripts "${PI_PACKAGE}@${PI_VERSION}" \
  && npm cache clean --force >/dev/null 2>&1 \
  && pi --version
 
-# Orbi at the pinned tag. /opt/orbi is the deploy home: a real checkout,
-# because Orbi's source-freshness gate compares it with engine_source_track.
-RUN git clone -q --depth 1 --branch "${ORBI_TAG}" "${ORBI_REPO}" /opt/orbi \
+# Orbi at the pinned tag, installed the way Orbi installs itself: an editable
+# uv tool from the deploy home. /opt/orbi is a real checkout because Orbi's
+# source-freshness gate compares it with engine_source_track.
+#
+# Every tick starts with Orbi's install gate, which reinstalls with uv (and so
+# needs PyPI) unless <deploy home>/.orbi/cli-install.json records the current
+# pyproject.toml. The root filesystem is new on every resume, so that record is
+# written here, into the image: ticks then never reinstall and never need PyPI.
+ENV PATH="/root/.local/bin:${PATH}"
+RUN pip install --no-cache-dir "uv==${UV_VERSION}" \
+ && git clone -q --depth 1 --branch "${ORBI_TAG}" "${ORBI_REPO}" /opt/orbi \
  && test "$(git -C /opt/orbi rev-parse HEAD)" = "${ORBI_COMMIT}" \
- && pip install --no-cache-dir --no-deps -e /opt/orbi \
+ && uv tool install --force --reinstall --editable --python python3 /opt/orbi \
+ && mkdir -p /opt/orbi/.orbi \
+ && printf '{"pyproject_sha256": "%s"}' "$(sha256sum /opt/orbi/pyproject.toml | cut -d' ' -f1)" \
+      > /opt/orbi/.orbi/cli-install.json \
+ && test -z "$(git -C /opt/orbi status --porcelain)" \
  && orbi --version
 
 COPY --from=ax-runner /out/ax-runner /usr/local/bin/ax-runner
 COPY ax-orbi-agent /usr/local/bin/ax-orbi-agent
-RUN chmod 0755 /usr/local/bin/ax-orbi-agent \
+# See image/systemctl-shim: Orbi expects systemd; the sandbox has none.
+COPY systemctl-shim /usr/local/bin/systemctl
+RUN chmod 0755 /usr/local/bin/ax-orbi-agent /usr/local/bin/systemctl \
  && mkdir -p /etc/ax-orbi \
  && printf '{"ax_ref":"%s","orbi_tag":"%s","orbi_commit":"%s","pi_version":"%s","gh_version":"%s"}\n' \
       "${AX_REF}" "${ORBI_TAG}" "${ORBI_COMMIT}" "${PI_VERSION}" "${GH_VERSION}" \

@@ -215,11 +215,12 @@ def run_quiet(cmd: list[str], env: dict, cwd: str | None = None, timeout: int = 
         return 124, f"{' '.join(cmd)}: timed out after {timeout}s"
 
 
-def prepare(sdir: Path) -> dict:
+def prepare(sdir: Path, boot_id: str | None = None) -> dict:
     """Make the environment ready for a tick, without starting one.
 
-    Idempotent: runs at every start. Returns the report it also writes to
-    prepare.json; `ok` is False when a tick could not possibly work.
+    Idempotent: runs at every start. Returns the report; `ok` is False when a
+    tick could not possibly work. Only the supervisor (which passes its boot
+    id) writes prepare.json, so the file always describes a known start.
     """
     checks: list[dict] = []
 
@@ -231,13 +232,19 @@ def prepare(sdir: Path) -> dict:
         return ok
 
     report = {"version": STATE_VERSION, "at": now(), "ok": False, "checks": checks,
-              "image": image_versions()}
+              "image": image_versions(), "bootId": boot_id}
+
+    def finish() -> dict:
+        report["ok"] = bool(checks) and all(c["ok"] for c in checks)
+        if boot_id:
+            write_json(sdir / "prepare.json", report)
+        return report
+
     try:
         cfg = load_config()
     except ConfigError as exc:
         check("config", False, str(exc), "re-render the task with `ax-orbi prepare`")
-        write_json(sdir / "prepare.json", report)
-        return report
+        return finish()
     check("config", True, f"{cfg['source_repo']} @ {cfg['base_branch']}")
 
     for sub in ("home", "requests", "runs"):
@@ -291,9 +298,7 @@ def prepare(sdir: Path) -> dict:
         check("git-credentials", False, "GH_TOKEN is not set",
               "set [credentials.github] in the deployment config")
 
-    report["ok"] = all(c["ok"] for c in checks)
-    write_json(sdir / "prepare.json", report)
-    return report
+    return finish()
 
 
 # ---- runs ------------------------------------------------------------------
@@ -459,11 +464,14 @@ class Supervisor:
 
         for sub in ("requests", "runs"):
             (self.sdir / sub).mkdir(parents=True, exist_ok=True)
+        # Announce this start before anything slow: from here on, a reader can
+        # tell this boot's prepare report from the previous boot's.
+        self.beat()
         recovered = mark_interrupted(self.sdir, self.boot_id)
         for run_id in recovered:
             print(f"ax-orbi-agent: run {run_id} was interrupted by the last stop; kept, not re-run",
                   flush=True)
-        report = prepare(self.sdir)
+        report = prepare(self.sdir, self.boot_id)
         self.prepared = report["ok"]
         for item in report["checks"]:
             if not item["ok"]:
@@ -480,7 +488,7 @@ class Supervisor:
                 continue
             if not self.prepared:
                 # Re-check instead of refusing forever: the cause may be gone.
-                self.prepared = prepare(self.sdir)["ok"]
+                self.prepared = prepare(self.sdir, self.boot_id)["ok"]
             if not self.prepared:
                 rdir = run_path(self.sdir, run_id)
                 rdir.mkdir(parents=True, exist_ok=True)
@@ -544,11 +552,18 @@ def cmd_request_tick(args) -> int:
 
 def collect_status(sdir: Path, run_id: str | None, limit: int) -> dict:
     ids = all_run_ids(sdir) if (sdir / "requests").is_dir() else []
+    alive = supervisor_alive(sdir)
+    health = read_json(sdir / "health.json")
+    prep = read_json(sdir / "prepare.json")
+    # After a resume the old boot's files are still on the volume. The
+    # supervisor is ready only once THIS boot's prepare report exists.
+    current = bool(alive and health and prep and health.get("bootId")
+                   and health.get("bootId") == prep.get("bootId"))
     status = {
         "version": STATE_VERSION, "at": now(), "stateDir": str(sdir),
-        "supervisorAlive": supervisor_alive(sdir),
-        "health": read_json(sdir / "health.json"),
-        "prepare": read_json(sdir / "prepare.json"),
+        "supervisorAlive": alive, "started": current,
+        "ready": bool(current and prep.get("ok")),
+        "health": health, "prepare": prep if current else None,
         "counts": {}, "runs": [],
     }
     summaries = [run_summary(sdir, rid) for rid in ids]
@@ -619,7 +634,6 @@ def main(argv: list[str] | None = None) -> int:
         return Supervisor(state_dir()).serve()
     if args.command == "prepare":
         sdir = state_dir()
-        sdir.mkdir(parents=True, exist_ok=True)
         report = prepare(sdir)
         print(json.dumps(report, sort_keys=True))
         return EXIT_OK if report["ok"] else EXIT_FAILED

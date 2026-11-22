@@ -410,6 +410,7 @@ def build_args(versions: dict) -> dict:
         "ORBI_REPO": versions["orbi"]["repo"], "ORBI_TAG": versions["orbi"]["tag"],
         "ORBI_COMMIT": versions["orbi"]["commit"],
         "PI_PACKAGE": versions["pi"]["package"], "PI_VERSION": versions["pi"]["version"],
+        "UV_VERSION": versions["uv"]["version"],
         "GH_VERSION": versions["gh"]["version"],
         "GH_SHA256_AMD64": versions["gh"]["sha256_amd64"],
         "GH_SHA256_ARM64": versions["gh"]["sha256_arm64"],
@@ -418,8 +419,9 @@ def build_args(versions: dict) -> dict:
 
 def pins_id(versions: dict) -> str:
     blob = json.dumps(build_args(versions), sort_keys=True).encode()
-    agent = (ROOT / "image" / "ax-orbi-agent").read_bytes()
-    return hashlib.sha256(blob + agent).hexdigest()[:12]
+    files = b"".join((ROOT / "image" / name).read_bytes()
+                     for name in ("Dockerfile", "ax-orbi-agent", "systemctl-shim"))
+    return hashlib.sha256(blob + files).hexdigest()[:12]
 
 
 def cmd_build(args, report: Report) -> int:
@@ -473,7 +475,7 @@ def wait_for_agent(ax: Ax, task: str, timeout: int, want_prepared: bool = True):
     status, err = None, "no answer yet"
     while time.monotonic() < deadline:
         status, err = ax.agent(task, "status", "--json")
-        if status and status.get("supervisorAlive") and (status.get("prepare") or not want_prepared):
+        if status and (status.get("started") or (status.get("supervisorAlive") and not want_prepared)):
             return status, ""
         time.sleep(3)
     return status, err or "the agent's supervisor did not come up in time"
