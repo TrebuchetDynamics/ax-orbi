@@ -812,7 +812,7 @@ def cmd_recover(args, report: Report) -> int:
                          interrupted=[r["id"] for r in interrupted])
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-c", "--config", type=Path, default=Path("ax-orbi.toml"),
                         help="deployment config (default: ./ax-orbi.toml)")
@@ -850,8 +850,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yes-delete-state", action="store_true")
     p = sub.add_parser("recover", parents=[common], help="resume and report interrupted runs")
     p.add_argument("--timeout", type=int, default=300)
+    return parser
 
-    args = parser.parse_args(argv)
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     report = Report(args.json)
     handler = {"check": cmd_check, "build": cmd_build, "render": cmd_render, "prepare": cmd_prepare,
                "run": cmd_run, "inspect": cmd_inspect, "stop": cmd_stop, "recover": cmd_recover}
