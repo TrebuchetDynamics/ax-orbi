@@ -1,12 +1,12 @@
 # Set up ax-orbi
 
-Use a disposable GitHub repository for your first deployment. The [README](../README.md#limits) explains what a tick's exit code means and what the sandbox does not protect against.
+Use a disposable GitHub repository for your first deployment. Run the command blocks in the same Bash session and stop if a command fails. The [README](../README.md#limits) explains what a tick's exit code means and what the sandbox does not protect against.
 
 ## Prerequisites
 
 - A checkout of ax-orbi, Python 3.11 or later, Git, Make, Bash and Go 1.27.1 or later to build the pinned AX CLI.
-- For the local AX stack: a running rootful Docker engine, a container host (or VM) with Linux kernel 6.8+ and at least 4 GiB of RAM (6 GiB or more recommended). AX can fetch `kind` and `kubectl` if they're not on `PATH`. See the pinned [AX local installer guide](https://github.com/google/ax/blob/2ede873cb5a1a519c0b5adf2adc8e97fe80ca1d2/docs/local_installer.md) and [installation guide](https://github.com/google/ax/blob/2ede873cb5a1a519c0b5adf2adc8e97fe80ca1d2/docs/installation.md).
-- A GitHub personal access token scoped to the disposable repo, allowing Orbi to push branches and manage issues and pull requests, and a key for your HTTPS model API. Store neither in TOML. You also need permission to create and label Kubernetes Secrets in `ax-system`.
+- For the local AX stack: `curl`, a running rootful Docker engine, and a container host (or VM) with Linux kernel 6.8+ and at least 4 GiB of RAM (6 GiB or more recommended). AX can fetch `kind` and `kubectl` if they're not on `PATH`. See the pinned [AX local installer guide](https://github.com/google/ax/blob/2ede873cb5a1a519c0b5adf2adc8e97fe80ca1d2/docs/local_installer.md) and [installation guide](https://github.com/google/ax/blob/2ede873cb5a1a519c0b5adf2adc8e97fe80ca1d2/docs/installation.md).
+- A disposable GitHub repository with at least one commit on the base branch. Use a personal access token scoped to that repo, allowing Orbi to push branches and manage issues and pull requests, and a key for your HTTPS model API. Store neither in TOML. You also need permission to create and label Kubernetes Secrets in `ax-system`.
 
 ## 1. Build the pinned AX CLI
 
@@ -46,7 +46,7 @@ bin/ax-orbi build --engine docker --push
 cp examples/minimal/ax-orbi.toml ax-orbi.toml
 ```
 
-Edit `ax-orbi.toml`: set `repository.source` and `repository.base_branch` for the disposable repository, replace the all-zero `image.ref` with the digest reference printed by the build, and fill in the model provider, ID and HTTPS base URL. The example uses an OpenAI-compatible API with `Authorization: Bearer …`; match the provider's API type and header format. Keep the example Secret references for the next step. If deploying to a different registry, pass `--repository "$IMAGE_REPOSITORY"` to `build`, where `IMAGE_REPOSITORY` is the image repository (without a tag) writable by your build and readable by AX. Set `ax.context` if you need to target a context other than the active one.
+Edit `ax-orbi.toml`: set `repository.source` and `repository.base_branch` for the disposable repository, replace the all-zero `image.ref` with the digest reference printed by the build, and fill in the model provider, ID and HTTPS base URL. The example uses an OpenAI-compatible API with `Authorization: Bearer …`; match the provider's API type and header format. Keep the example Secret references for the next step. If the local registry uses a different port, or you are targeting an existing cluster, set `IMAGE_REPOSITORY` to an image repository (without a tag) your build can push to and AX can pull from, and pass `--repository "$IMAGE_REPOSITORY"` to `build`. The local AX stack pulls images anonymously. Set `ax.context` if you need to target a context other than the active one.
 
 ## 4. Create the Kubernetes Secrets
 
@@ -92,7 +92,7 @@ bin/ax-orbi inspect
 
 - `check` should report `ready`. If it reports `secret:github` or `secret:model` as not found, check the Kubernetes context and the `namespace/name` in the config, then create and label the corresponding Secret. If it warns that the label is missing, add it before preparing. A Gateway 403 can also mean the credential provider policy does not grant access.
 - `prepare` applies the Gateway, Workspace and Task and checks agent readiness. It does not start a delivery. If the config is missing, copy the [example](../examples/minimal/ax-orbi.toml), edit it as above and retry.
-- `run` requests one tick. Use the run ID it prints with `bin/ax-orbi inspect --run "$RUN_ID" --logs` to inspect that run and its log. Check GitHub for the actual issue and PR state: a successful tick can find no eligible work.
+- `run` requests one tick. Set `RUN_ID` to the ID printed by `run`, then use `bin/ax-orbi inspect --run "$RUN_ID" --logs` to inspect that run and its log. Check GitHub for the actual issue and PR state: a successful tick can find no eligible work.
 
 ## 6. Stop and recover
 

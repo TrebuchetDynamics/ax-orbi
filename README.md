@@ -8,7 +8,7 @@ ax-orbi runs Orbi and its Pi coding agent inside a Google AX sandbox. **Status: 
 
 ## Quick start
 
-From the repository root, with Python 3.11+ and Make, copy the [example configuration](examples/minimal/ax-orbi.toml) and preview the deployment without a cluster:
+From the repository root, with Python 3.11+, Git, Make, and GNU coreutils `timeout` on `PATH`, copy the [example configuration](examples/minimal/ax-orbi.toml) and preview the deployment without a cluster:
 
 ```sh
 cp examples/minimal/ax-orbi.toml ax-orbi.toml
@@ -20,6 +20,8 @@ make test
 The check validates the config and also checks for the AX CLI, so it can report valid config yet exit 1 if `ax` is missing. Rendering doesn't require `ax`; it prints a Gateway, a Workspace and a Task. The example uses placeholders, not a deployable image or credentials. Follow the [setup guide](docs/SETUP.md) to install the pinned AX CLI and replace the placeholders before deploying.
 
 `make verify` runs `make test`, then builds the pinned image and runs the [container verifier](verify/container.sh) with Docker. To use an existing Docker image instead of building, run `make verify IMAGE="$IMAGE"` with `IMAGE` set to its tag or digest reference. Container verification exercises the runner and agent without a cluster; it does not qualify the sandbox, workspace snapshots, gateway or `ax ssh` on AX.
+
+The existing verifier can fail in phase 5 with `Orbi rejected the generated configuration` after GitHub rejects the verifier's placeholder credentials. This is not an error in your TOML; the verifier does not read your deployment config or Secrets.
 
 ## CLI
 
