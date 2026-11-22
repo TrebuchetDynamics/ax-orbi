@@ -568,7 +568,12 @@ def report_prepare(report: Report, status: dict | None, err: str) -> bool:
     report.check("agent", bool(status.get("supervisorAlive")),
                  "supervisor alive" if status.get("supervisorAlive") else "supervisor is not running",
                  "inspect the sandbox, or use `ax-orbi stop --force` then `ax-orbi recover`")
-    prep = status.get("prepare") or {}
+    prep = status.get("prepare")
+    if prep is None:
+        return report.check("image-pins", False,
+                            "image pins not verified: no prepare report for this boot",
+                            "retry `ax-orbi inspect` after the supervisor finishes starting"
+                            if status.get("supervisorAlive") else "")
     for item in prep.get("checks", []):
         report.check(f"sandbox:{item['name']}", item["ok"], item["detail"], item.get("fix", ""))
     versions = load_versions()

@@ -597,6 +597,20 @@ class CliFlowTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIs(next(c for c in out["checks"] if c["name"] == "image-pins")["ok"], True)
 
+    def test_inspect_reports_unavailable_prepare_metadata(self):
+        self.assertEqual(self.prepare()[0], 0)
+        # A new boot exposes no prepare report until its supervisor finishes prepare.
+        (self.sb.state / "prepare.json").unlink()
+
+        code, out = self.cli("inspect")
+        self.assertEqual(code, 1, out)
+        self.assertIsNone(out["status"]["prepare"])
+        pins = next(c for c in out["checks"] if c["name"] == "image-pins")
+        self.assertIs(pins["ok"], False)
+        self.assertIn("no prepare report for this boot", pins["detail"])
+        self.assertIn("retry `ax-orbi inspect`", pins["fix"])
+        self.assertNotIn("build --push", pins["fix"])
+
     def test_prepare_run_inspect_stop_recover(self):
         code, out = self.prepare()
         self.assertEqual(code, 0, out)
