@@ -36,7 +36,7 @@ Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `-c` / `
 | `check` | Checks prerequisites, version pins and the deployment configuration. |
 | `build` | Builds the task image from `versions.toml` and optionally pushes it. |
 | `render` | Prints the deployment's AX manifests. |
-| `prepare` | Creates and starts the sandbox without starting a delivery. |
+| `prepare` | Creates, starts or resumes the sandbox without requesting a new tick. |
 | `run` | Requests one Orbi tick and waits for the result by default. |
 | `inspect` | Reports sandbox health, recent runs and their evidence. |
 | `stop` | Checkpoints the sandbox, keeping state by default. |

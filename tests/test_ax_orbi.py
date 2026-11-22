@@ -413,11 +413,10 @@ class SkillTests(unittest.TestCase):
         commands = next(a.choices for a in parser._actions if isinstance(a, argparse._SubParsersAction))
         options = {name: {option for action in sub._actions for option in action.option_strings}
                    for name, sub in commands.items()}
-        long_option = r"(?<![\w-])--[a-z][a-z0-9-]*"
-        # Check standalone option mentions as well as options in command examples.
+        long_option = r"(?<![\w-])--\w[\w-]*"
+        # Check standalone option mentions and command examples, even in prose.
         self.assertEqual(set(re.findall(long_option, text)) - set().union(*options.values()), set())
-        examples = re.findall(r"(?:`|^[ \t]*)(?:bin/)?ax-orbi[ \t]+([\w-]+)([^`\n]*)",
-                              text, re.MULTILINE)
+        examples = re.findall(r"(?<![\w-])ax-orbi[ \t]+([\w-]+)([^`\n;&|]*)", text)
         self.assertTrue(examples, "no ax-orbi commands found in the skill")
         for name, args in examples:
             with self.subTest(command=name, args=args):

@@ -81,7 +81,7 @@ Run this in Bash. If the installer downloaded `kubectl`, add `$HOME/.ax/bin` to 
 
 ## 5. Check, prepare, run and inspect
 
-**Not yet verified on a live cluster.** Run each command from the ax-orbi checkout. Continue only after each succeeds.
+**Not yet verified on a live cluster.** Run each command from the ax-orbi checkout. Continue only after each succeeds. If reusing a deployment name, inspect first: both `prepare` and `run` can resume a suspended task, and queued requests can execute on resume.
 
 ```bash
 bin/ax-orbi check --json
@@ -91,7 +91,7 @@ bin/ax-orbi inspect --json
 ```
 
 - `check` should exit 0, possibly with warnings. If it reports `secret:github` or `secret:model` as not found, check the Kubernetes context and the `namespace/name` in the config, then create and label the corresponding Secret. If it warns that the label is missing, add it before preparing. A Gateway 403 can also mean the credential provider policy does not grant access.
-- `prepare` applies the Gateway, Workspace and Task and checks agent readiness and image pins. It does not start a delivery. If the config is missing, copy the [example](../examples/minimal/ax-orbi.toml), edit it as above and retry.
+- `prepare` applies the Gateway, Workspace and Task and checks agent readiness and image pins. It does not request a new tick. If the config is missing, copy the [example](../examples/minimal/ax-orbi.toml), edit it as above and retry.
 - `run` requests one tick. Set `RUN_ID` to `run.id` from its JSON, then use `bin/ax-orbi inspect --json --run "$RUN_ID" --logs` to inspect the run and its log. Check GitHub for the actual issue and PR state: a tick with `status: succeeded` can find no eligible work.
 
 ## 6. Stop and recover
