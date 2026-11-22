@@ -476,6 +476,17 @@ class CliFlowTests(unittest.TestCase):
         except ValueError:
             self.fail(f"not JSON (exit {proc.returncode}): {proc.stdout}\n{proc.stderr}")
 
+    def task_state(self):
+        return json.loads((self.sb.tmp / "ax-state.json").read_text())
+
+    def set_phase(self, phase):
+        state = self.task_state()
+        state["phase"] = phase
+        (self.sb.tmp / "ax-state.json").write_text(json.dumps(state))
+
+    def ax_calls(self):
+        return [json.loads(line) for line in (self.sb.tmp / "ax-calls.jsonl").read_text().splitlines()]
+
     def fix_repo_path(self):
         # The agent's default repo_dir is /workspace/repo; point the fake
         # sandbox at the temp checkout instead.
@@ -529,6 +540,155 @@ class CliFlowTests(unittest.TestCase):
         self.assertEqual(out["status"]["runs"][0]["status"], "interrupted")
         self.assertIn("got-sigterm", out["logs"])
         self.assertEqual(out["status"]["counts"], {"failed": 1, "interrupted": 1, "succeeded": 1})
+
+    def test_stop_requires_idle_observation(self):
+        self.assertEqual(self.prepare()[0], 0)
+        self.env["FAKE_AX_FAIL_SSH"] = "1"
+
+        code, out = self.cli("stop")
+        self.assertEqual(code, 3, out)
+        self.assertEqual(self.task_state()["phase"], "Working")
+        self.assertIn("--force", out["checks"][-1]["fix"])
+        self.assertIn("simulated SSH failure", out["checks"][-1]["detail"])
+        self.assertNotIn("suspend", [call[0] for call in self.ax_calls()])
+
+        code, out = self.cli("stop", "--force")
+        self.assertEqual(code, 0, out)
+        self.assertIs(out["executionUnknown"], True)
+        self.assertEqual(self.task_state()["phase"], "Suspended")
+
+    def test_inspect_and_run_report_failed_task(self):
+        self.assertEqual(self.prepare()[0], 0)
+        self.set_phase("Failed")
+        calls_before = len(self.ax_calls())
+
+        code, out = self.cli("inspect")
+        self.assertEqual((code, out["taskState"]), (1, "Failed"), out)
+        self.assertNotIn("checkpointed", json.dumps(out["checks"]))
+        self.assertIn("ax describe task orbi-demo", out["checks"][-1]["fix"])
+
+        code, out = self.cli("run", "--start-timeout", "1")
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("resume", [call[0] for call in self.ax_calls()[calls_before:]])
+
+        code, out = self.cli("stop", "--delete", "--yes-delete-state")
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(out["checks"][0]["ok"])
+        self.assertIn("Failed", out["checks"][0]["detail"])
+        self.assertNotIn("suspend", [call[0] for call in self.ax_calls()[calls_before:]])
+
+    def test_inspect_distinguishes_suspending_from_suspended(self):
+        self.assertEqual(self.prepare()[0], 0)
+        self.set_phase("Suspending")
+        code, out = self.cli("inspect")
+        self.assertEqual((code, out["taskState"]), (3, "Suspending"), out)
+        self.assertNotIn("checkpointed", json.dumps(out["checks"]))
+
+        self.set_phase("Suspended")
+        code, out = self.cli("inspect")
+        self.assertEqual((code, out["taskState"]), (0, "Suspended"), out)
+        self.assertIn("checkpointed", out["checks"][-1]["detail"])
+
+    def test_stop_observes_idle_then_recovers(self):
+        self.assertEqual(self.prepare()[0], 0)
+        code, out = self.cli("stop")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("executionUnknown", out)
+        code, out = self.cli("inspect")
+        self.assertEqual((code, out["taskState"]), (0, "Suspended"), out)
+        code, out = self.cli("recover", "--timeout", "30")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.task_state()["phase"], "Working")
+        self.assertEqual(self.sb.ticks(), 0)
+
+    def test_stop_rejects_incomplete_or_nonidle_status(self):
+        self.assertEqual(self.prepare()[0], 0)
+        idle = {"supervisorAlive": True, "health": {"state": "idle", "currentRun": None}, "counts": {}}
+        for status in (
+            "{invalid JSON",
+            json.dumps(dict(idle, supervisorAlive=False)),
+            json.dumps(dict(idle, health={"state": "stopping", "currentRun": None})),
+            json.dumps(dict(idle, health={"state": "idle"})),
+            json.dumps(dict(idle, counts=None)),
+            json.dumps(dict(idle, counts={"queued": 1})),
+            json.dumps(dict(idle, counts={"running": 1})),
+        ):
+            with self.subTest(status=status):
+                self.env["FAKE_AX_STATUS"] = status
+                code, out = self.cli("stop")
+                self.assertEqual(code, 3, out)
+                self.assertIn("--force", out["checks"][-1]["fix"])
+        self.assertNotIn("suspend", [call[0] for call in self.ax_calls()])
+
+    def test_nonworking_states_are_not_resumed_or_suspended(self):
+        self.assertEqual(self.prepare()[0], 0)
+        calls_before = len(self.ax_calls())
+        for phase, expected in (("Cancelled", 1), ("Completed", 1), ("Terminating", 1),
+                                ("Idle", 3), ("RequiresAction", 3), ("Unknown", 3),
+                                ("Running", 3), ("Other", 3), ("Queued", 3), ("Suspending", 3)):
+            self.set_phase(phase)
+            for args in (("inspect",), ("stop",), ("prepare", "--timeout", "0"),
+                         ("recover", "--timeout", "0"), ("run", "--start-timeout", "0")):
+                with self.subTest(phase=phase, command=args[0]):
+                    code, out = self.cli(*args)
+                    self.assertEqual((code, out["taskState"]), (expected, phase), out)
+                    self.assertNotIn("checkpointed", json.dumps(out["checks"]))
+        self.assertTrue({"resume", "suspend", "ssh"}.isdisjoint(
+            call[0] for call in self.ax_calls()[calls_before:]))
+
+    def test_recover_polls_a_transitional_state(self):
+        self.assertEqual(self.prepare()[0], 0)
+        self.set_phase("Queued")
+        calls_before = len(self.ax_calls())
+        code, out = self.cli("recover", "--timeout", "2")
+        self.assertEqual((code, out["taskState"]), (3, "Queued"), out)
+        self.assertGreater(self.ax_calls()[calls_before:].count(["get", "tasks"]), 1)
+
+        calls_before = len(self.ax_calls())
+
+        def finish_transition():
+            wait_until(lambda: ["get", "tasks"] in self.ax_calls()[calls_before:],
+                       timeout=4, what="recover to observe Queued")
+            self.set_phase("Working")
+
+        transition = threading.Thread(target=finish_transition)
+        transition.start()
+        try:
+            code, out = self.cli("recover", "--timeout", "5")
+            self.assertEqual((code, out["taskState"]), (0, "Working"), out)
+            self.assertNotIn("resume", [call[0] for call in self.ax_calls()[calls_before:]])
+        finally:
+            transition.join(timeout=5)
+
+    def test_unreachable_is_distinct_from_unknown_and_can_be_deleted(self):
+        self.assertEqual(self.prepare()[0], 0)
+        self.set_phase("Unknown")
+        code, out = self.cli("inspect")
+        self.assertEqual((code, out["taskState"]), (3, "Unknown"), out)
+        self.assertIn("'Unknown'", out["checks"][-1]["detail"])
+
+        self.env["FAKE_AX_FAIL_GET"] = "1"
+        for command in ("inspect", "stop", "recover", "run"):
+            with self.subTest(command=command):
+                code, out = self.cli(command)
+                self.assertEqual(code, 1, out)
+                self.assertIsNone(out["taskState"])
+                self.assertIn("cannot reach the AX control plane", out["checks"][-1]["detail"])
+        code, out = self.cli("prepare")
+        self.assertEqual(code, 1, out)
+        cluster = next(check for check in out["checks"] if check["name"] == "ax-cluster")
+        self.assertFalse(cluster["ok"])
+        self.assertIn("cannot connect to AX", cluster["detail"])
+
+        calls_before = len(self.ax_calls())
+        code, out = self.cli("stop", "--delete", "--yes-delete-state")
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(out["checks"][0]["ok"])
+        self.assertEqual(self.ax_calls()[calls_before:], [
+            ["get", "tasks"], ["delete", "task", "orbi-demo"],
+            ["delete", "workspace", "orbi-demo-ws"], ["delete", "gateway", "orbi-demo-gw"],
+        ])
+        self.assertNotIn("applied", self.task_state())
 
     def test_changed_config_explains_immutability(self):
         self.assertEqual(self.prepare()[0], 0)

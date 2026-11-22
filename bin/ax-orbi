@@ -252,6 +252,17 @@ def render(cfg: dict) -> str:
 
 # ---- running ax ------------------------------------------------------------
 
+# AX's FormatTaskState labels, plus the two outcomes of looking up the task.
+TASK_CLASSES = {
+    "Working": "active",
+    "Suspended": "checkpointed",
+    "Suspending": "transitional", "Queued": "transitional",
+    "Failed": "failed", "Cancelled": "failed", "Completed": "failed", "Terminating": "failed",
+    "Idle": "unrecognised", "RequiresAction": "unrecognised", "Unknown": "unrecognised",
+    "": "missing", None: "unreachable",
+}
+
+
 class Ax:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -259,7 +270,7 @@ class Ax:
         if cfg["ax"].get("context"):
             self.base += ["--context", cfg["ax"]["context"]]
 
-    def run(self, *args: str, stdin: str | None = None, timeout: int = 900):
+    def run(self, *args: str, stdin: str | None = None, timeout: float = 900):
         try:
             proc = subprocess.run(self.base + list(args), input=stdin, text=True,
                                   capture_output=True, timeout=timeout)
@@ -269,28 +280,29 @@ class Ax:
             return 124, "", f"ax {' '.join(args)}: timed out after {timeout}s"
         return proc.returncode, proc.stdout, proc.stderr
 
-    def task_state(self, task: str) -> str:
-        """`Working`, `Suspended`, ... or `NotFound` / `Unknown`."""
-        code, out, err = self.run("get", "tasks", timeout=60)
+    def task_state(self, task: str, timeout: float = 60) -> str | None:
+        """An AX label, empty if absent, or None if the lookup failed."""
+        code, out, _ = self.run("get", "tasks", timeout=timeout)
         if code != 0:
-            return "Unknown"
+            return None
         for line in out.splitlines()[1:]:
             cols = line.split()
             if len(cols) >= 3 and cols[0] == task:
                 return cols[2]
-        return "NotFound"
+        return ""
 
-    def agent(self, task: str, *args: str, timeout: int = 120) -> tuple[dict | None, str]:
+    def agent(self, task: str, *args: str, timeout: float = 120) -> tuple[dict | None, str]:
         """Run ax-orbi-agent in the sandbox; return (parsed JSON, error)."""
         code, out, err = self.run("ssh", task, "--", "/usr/local/bin/ax-orbi-agent", *args,
                                   timeout=timeout)
-        for line in reversed(out.splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    return json.loads(line), ""
-                except ValueError:
-                    break
+        if code == 0:
+            for line in reversed(out.splitlines()):
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        return json.loads(line), ""
+                    except ValueError:
+                        break
         return None, (err.strip() or out.strip() or f"ax ssh exited {code}")
 
 
@@ -469,29 +481,54 @@ def cmd_render(args, report: Report) -> int:
     return EXIT_OK
 
 
-def wait_for_agent(ax: Ax, task: str, timeout: int, want_prepared: bool = True):
-    """Poll the agent until its supervisor is alive (and has finished prepare)."""
-    deadline = time.monotonic() + timeout
+def wait_for_agent(ax: Ax, task: str, deadline: float):
+    """Poll until the supervisor has finished prepare, within the startup budget."""
     status, err = None, "no answer yet"
-    while time.monotonic() < deadline:
-        status, err = ax.agent(task, "status", "--json")
-        if status and (status.get("started") or (status.get("supervisorAlive") and not want_prepared)):
+    while (remaining := deadline - time.monotonic()) > 0:
+        status, err = ax.agent(task, "status", "--json", timeout=min(120, remaining))
+        if status and status.get("started"):
             return status, ""
-        time.sleep(3)
+        time.sleep(min(3, max(0, deadline - time.monotonic())))
     return status, err or "the agent's supervisor did not come up in time"
 
 
-def ensure_working(ax: Ax, task: str, report: Report) -> bool:
-    state = ax.task_state(task)
-    if state == "NotFound":
-        return report.check("task", False, f"task {task} does not exist",
-                            "create it with `ax-orbi prepare`")
-    if state in ("Working", "Running"):
-        return report.check("task", True, f"{task} is {state}")
+def report_task_error(report: Report, task: str, state: str | None, kind: str) -> int:
+    if kind == "missing":
+        report.check("task", False, f"task {task} does not exist", "create it with `ax-orbi prepare`")
+        return EXIT_FAILED
+    if kind == "unreachable":
+        report.check("task", False, "cannot reach the AX control plane",
+                     "`ax local status` or `ax ctx` shows what is down")
+        return EXIT_FAILED
+    detail = (f"{task} reported unrecognised state {state!r}" if kind == "unrecognised"
+              else f"{task} is {state}")
+    report.check("task", False, detail, f"check with `ax describe task {task}`")
+    return EXIT_FAILED if kind == "failed" else EXIT_INTERRUPTED
+
+
+def ensure_working(ax: Ax, task: str, report: Report, deadline: float) -> int:
+    state = ax.task_state(task, timeout=min(60, max(1, deadline - time.monotonic())))
+    while TASK_CLASSES.get(state) == "transitional":
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        next_state = ax.task_state(task, timeout=min(60, remaining))
+        if next_state is None and time.monotonic() >= deadline:
+            break  # Still transitioning when the polling budget ran out.
+        state = next_state
+    report.data["taskState"] = "NotFound" if state == "" else state
+    kind = TASK_CLASSES.get(state, "unrecognised")
+    if kind == "active":
+        report.check("task", True, f"{task} is {state}")
+        return EXIT_OK
+    if kind != "checkpointed":
+        return report_task_error(report, task, state, kind)
     code, out, err = ax.run("resume", "task", task)
-    return report.check("task", code == 0,
-                        f"{task} resumed (was {state})" if code == 0 else (err or out).strip(),
-                        f"`ax describe task {task}` shows the failing condition")
+    report.check("task", code == 0,
+                 f"{task} resumed (was {state})" if code == 0 else (err or out).strip(),
+                 f"`ax describe task {task}` shows the failing condition")
+    return EXIT_OK if code == 0 else EXIT_FAILED
 
 
 def report_prepare(report: Report, status: dict | None, err: str) -> bool:
@@ -501,7 +538,7 @@ def report_prepare(report: Report, status: dict | None, err: str) -> bool:
                             "If it persists, check `ax describe task`")
     report.check("agent", bool(status.get("supervisorAlive")),
                  "supervisor alive" if status.get("supervisorAlive") else "supervisor is not running",
-                 "recover with `ax-orbi stop` then `ax-orbi recover`")
+                 "inspect the sandbox, or use `ax-orbi stop --force` then `ax-orbi recover`")
     prep = status.get("prepare") or {}
     for item in prep.get("checks", []):
         report.check(f"sandbox:{item['name']}", item["ok"], item["detail"], item.get("fix", ""))
@@ -522,9 +559,11 @@ def cmd_prepare(args, report: Report) -> int:
                f"use a new `name` in the config, or delete this deployment first: ax-orbi stop --delete")
     if not report.check("apply", code == 0, detail.replace("\n", "; ") or "applied", fix):
         return report.finish(EXIT_FAILED)
-    if not ensure_working(ax, n["task"], report):
-        return report.finish(EXIT_FAILED)
-    status, err = wait_for_agent(ax, n["task"], args.timeout)
+    deadline = time.monotonic() + args.timeout
+    code = ensure_working(ax, n["task"], report, deadline)
+    if code != EXIT_OK:
+        return report.finish(code)
+    status, err = wait_for_agent(ax, n["task"], deadline)
     ready = report_prepare(report, status, err)
     report.say("prepared; no delivery was started. Run a tick with `ax-orbi run`."
                if ready else "the sandbox is up but not ready for a tick; fix the FAIL lines above")
@@ -552,9 +591,11 @@ def run_exit(run: dict | None) -> int:
 def cmd_run(args, report: Report) -> int:
     cfg = load_config(args.config)
     ax, n = Ax(cfg), names(cfg)
-    if not ensure_working(ax, n["task"], report):
-        return report.finish(EXIT_FAILED)
-    status, err = wait_for_agent(ax, n["task"], args.start_timeout)
+    deadline = time.monotonic() + args.start_timeout
+    code = ensure_working(ax, n["task"], report, deadline)
+    if code != EXIT_OK:
+        return report.finish(code)
+    status, err = wait_for_agent(ax, n["task"], deadline)
     if not report_prepare(report, status, err):
         report.say("not running a tick: the sandbox is not ready")
         return report.finish(EXIT_FAILED)
@@ -595,19 +636,15 @@ def cmd_inspect(args, report: Report) -> int:
     cfg = load_config(args.config)
     ax, n = Ax(cfg), names(cfg)
     state = ax.task_state(n["task"])
-    report.data["taskState"] = state
-    if state == "NotFound":
-        report.check("task", False, f"task {n['task']} does not exist", "create it with `ax-orbi prepare`")
-        return report.finish(EXIT_FAILED)
-    if state == "Unknown":
-        report.check("task", False, "cannot reach the AX control plane",
-                     "`ax local status` or `ax ctx` shows what is down")
-        return report.finish(EXIT_FAILED)
-    if state not in ("Working", "Running"):
+    report.data["taskState"] = "NotFound" if state == "" else state
+    kind = TASK_CLASSES.get(state, "unrecognised")
+    if kind == "checkpointed":
         report.check("task", None, f"{n['task']} is {state}: the sandbox is checkpointed, "
                                    "its state is kept, and nothing is running",
                      "bring it back with `ax-orbi recover`")
         return report.finish(EXIT_OK)
+    if kind != "active":
+        return report.finish(report_task_error(report, n["task"], state, kind))
     report.check("task", True, f"{n['task']} is {state}")
     extra = ["--run", args.run] if args.run else ["--limit", str(args.limit)]
     status, err = ax.agent(n["task"], "status", "--json", *extra)
@@ -615,7 +652,8 @@ def cmd_inspect(args, report: Report) -> int:
     runs = (status or {}).get("runs", [])
     if status and status.get("error"):
         report.check("run", False, status["error"])
-    health = (status or {}).get("health") or {}
+    health = status.get("health") if status and status.get("supervisorAlive") is True else None
+    health = health or {}
     report.say(f"supervisor state: {health.get('state', '?')}"
                + (f", running {health['currentRun']}" if health.get("currentRun") else "")
                + f"; runs: {json.dumps((status or {}).get('counts', {}), sort_keys=True)}")
@@ -634,49 +672,72 @@ def cmd_inspect(args, report: Report) -> int:
 def cmd_stop(args, report: Report) -> int:
     cfg = load_config(args.config)
     ax, n = Ax(cfg), names(cfg)
-    state = ax.task_state(n["task"])
-    if state == "NotFound" and not args.delete:
-        report.check("task", None, f"task {n['task']} does not exist; nothing to stop")
-        return report.finish(EXIT_OK)
-    running = None
-    if state == "Unknown":
-        report.check("task", False, "cannot reach the AX control plane",
-                     "`ax local status` or `ax ctx` shows what is down")
-        return report.finish(EXIT_FAILED)
-    if state in ("Working", "Running"):
-        status, _ = ax.agent(n["task"], "status", "--json")
-        running = ((status or {}).get("health") or {}).get("currentRun")
-        if running and not args.force:
-            report.check("stop", False, f"tick {running} is running",
-                         "wait for it (`ax-orbi inspect`), or stop anyway with --force: the tick is "
-                         "recorded as interrupted and Orbi resumes that delivery on the next tick")
-            return report.finish(EXIT_FAILED)
-        code, out, err = ax.run("suspend", "task", n["task"])
-        if not report.check("suspend", code == 0,
-                            f"{n['task']} checkpointed; /workspace is kept" if code == 0
-                            else (err or out).strip()):
-            return report.finish(EXIT_FAILED)
-    elif state != "NotFound":
-        report.check("suspend", True, f"{n['task']} is already {state}")
+    task = n["task"]
+    state = ax.task_state(task)
+    report.data["taskState"] = "NotFound" if state == "" else state
+    kind = TASK_CLASSES.get(state, "unrecognised")
     if args.delete:
         if not args.yes_delete_state:
             report.check("delete", False, "deleting removes the sandbox and its /workspace: "
                          "the checkout, unpushed worktrees, Pi sessions and every run record",
                          "repeat with --delete --yes-delete-state if that is what you want")
             return report.finish(EXIT_USAGE)
-        for kind, name in (("task", n["task"]), ("workspace", n["workspace"]), ("gateway", n["gateway"])):
-            code, out, err = ax.run("delete", kind, name)
+        detail = {"missing": f"task {task} does not exist",
+                  "unreachable": "cannot reach the AX control plane to observe the task"}
+        report.check("task", None, detail.get(kind, f"{task} reported state {state!r}"))
+        for resource, name in (("task", task), ("workspace", n["workspace"]), ("gateway", n["gateway"])):
+            code, out, err = ax.run("delete", resource, name)
             gone = code == 0 or "not found" in (out + err).lower()
-            report.check(f"delete:{kind}", gone, f"{name} deleted" if gone else (err or out).strip())
-    return report.finish(EXIT_OK if report.ok else EXIT_FAILED, interruptedRun=running)
+            report.check(f"delete:{resource}", gone, f"{name} deleted" if gone else (err or out).strip())
+        return report.finish(EXIT_OK if report.ok else EXIT_FAILED, interruptedRun=None)
+    if kind == "missing":
+        report.check("task", None, f"task {task} does not exist; nothing to stop")
+        return report.finish(EXIT_OK)
+    if kind == "checkpointed":
+        report.check("suspend", True, f"{task} is already {state}")
+        return report.finish(EXIT_OK, interruptedRun=None)
+    if kind != "active":
+        return report.finish(report_task_error(report, task, state, kind))
+
+    status, err = ax.agent(task, "status", "--json")
+    status = status or {}
+    health = status.get("health")
+    health = health if isinstance(health, dict) else {}
+    counts = status.get("counts")
+    current = health.get("currentRun")
+    alive = status.get("supervisorAlive") is True
+    running = current if alive and isinstance(current, str) and current else None
+    idle = (alive and health.get("state") == "idle" and "currentRun" in health
+            and current in (None, "") and isinstance(counts, dict)
+            and "queued" not in counts and "running" not in counts)
+    if running and not args.force:
+        report.check("stop", False, f"tick {running} is running",
+                     "wait for it (`ax-orbi inspect`), or stop anyway with --force: the tick is "
+                     "recorded as interrupted and Orbi resumes that delivery on the next tick")
+        return report.finish(EXIT_FAILED)
+    if not idle and not running:
+        report.check("stop", None if args.force else False,
+                     "cannot confirm the sandbox is idle; execution is unknown or active"
+                     + (f": {err}" if err else ""),
+                     "check `ax-orbi inspect` and retry, or stop anyway with --force" if not args.force else "")
+        if not args.force:
+            return report.finish(EXIT_INTERRUPTED)
+        report.data["executionUnknown"] = True
+    code, out, err = ax.run("suspend", "task", task)
+    if not report.check("suspend", code == 0,
+                        f"{task} checkpointed; /workspace is kept" if code == 0 else (err or out).strip()):
+        return report.finish(EXIT_FAILED)
+    return report.finish(EXIT_OK, interruptedRun=running)
 
 
 def cmd_recover(args, report: Report) -> int:
     cfg = load_config(args.config)
     ax, n = Ax(cfg), names(cfg)
-    if not ensure_working(ax, n["task"], report):
-        return report.finish(EXIT_FAILED)
-    status, err = wait_for_agent(ax, n["task"], args.timeout)
+    deadline = time.monotonic() + args.timeout
+    code = ensure_working(ax, n["task"], report, deadline)
+    if code != EXIT_OK:
+        return report.finish(code)
+    status, err = wait_for_agent(ax, n["task"], deadline)
     ready = report_prepare(report, status, err)
     runs = (status or {}).get("runs", [])
     interrupted = [r for r in runs if r.get("status") == "interrupted"]
@@ -724,9 +785,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=5)
     p.add_argument("--logs", action="store_true", help="print the end of the run's log")
     p.add_argument("--tail", type=int, default=100)
-    p = sub.add_parser("stop", parents=[common], help="checkpoint the sandbox; state is kept")
-    p.add_argument("--force", action="store_true", help="stop even while a tick is running")
-    p.add_argument("--delete", action="store_true", help="also delete the sandbox and its state")
+    p = sub.add_parser("stop", parents=[common], help="checkpoint the sandbox; state is kept",
+                       description="Without --force, suspending requires an idle observation. "
+                                   "A request can arrive between the observation and the suspend.")
+    p.add_argument("--force", action="store_true", help="stop even if a tick is active or execution is unknown")
+    p.add_argument("--delete", action="store_true", help="delete the sandbox and its state instead of suspending")
     p.add_argument("--yes-delete-state", action="store_true")
     p = sub.add_parser("recover", parents=[common], help="resume and report interrupted runs")
     p.add_argument("--timeout", type=int, default=300)
