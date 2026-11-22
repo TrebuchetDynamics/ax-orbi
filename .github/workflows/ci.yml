@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.x']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          check-latest: ${{ matrix.python-version == '3.x' }}
+      - &offline-tools
+        name: Isolate the offline suite from the runner's kubectl
+        run: |
+          # The suite uses fake AX and no Kubernetes cluster. If kubectl is
+          # discoverable, the real CLI tries to look up Kubernetes secrets.
+          tools=(bash cat env git make python3 rm sh sleep timeout)
+          if [[ "$GITHUB_JOB" == container ]]; then
+            tools+=(dirname docker grep mktemp sed seq tail tr)
+          fi
+          mkdir -p "$RUNNER_TEMP/ax-orbi-tools"
+          for tool in "${tools[@]}"; do
+            ln -s "$(type -P "$tool")" "$RUNNER_TEMP/ax-orbi-tools/$tool"
+          done
+      - name: Run make test
+        run: PATH="$RUNNER_TEMP/ax-orbi-tools" timeout -k 10s 330s make test
+      - name: Check Python and shell syntax
+        run: |
+          python3 -m py_compile bin/ax-orbi image/ax-orbi-agent
+          sh -n image/systemctl-shim
+          bash -n verify/container.sh
+
+  container-inputs:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check for changed image inputs
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: |
+          if [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ]; then
+            BASE_SHA=$(git hash-object -w -t tree /dev/null)
+          elif ! git cat-file -e "$BASE_SHA^{commit}"; then
+            # A force push can leave the old tip outside all fetched refs.
+            timeout -k 5s 60s git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
+          changed=$(git diff --name-only "$BASE_SHA" HEAD -- image/ versions.toml verify/)
+          if [ -n "$changed" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  container:
+    needs: container-inputs
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.container-inputs.outputs.changed == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - *offline-tools
+      - name: Run make verify
+        run: PATH="$RUNNER_TEMP/ax-orbi-tools" timeout -k 30s 5000s make verify
