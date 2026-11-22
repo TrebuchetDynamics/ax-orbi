@@ -357,6 +357,7 @@ def mark_interrupted(sdir: Path, boot_id: str) -> list[str]:
 class Supervisor:
     def __init__(self, sdir: Path):
         self.sdir = sdir
+        self.pid = os.getpid()
         self.boot_id = uuid.uuid4().hex[:12]
         self.started = now()
         self.stopping = threading.Event()
@@ -366,7 +367,7 @@ class Supervisor:
         self.lock = threading.Lock()
 
     def health(self) -> dict:
-        return {"version": STATE_VERSION, "pid": os.getpid(), "bootId": self.boot_id,
+        return {"version": STATE_VERSION, "pid": self.pid, "bootId": self.boot_id,
                 "startedAt": self.started, "updatedAt": now(), "prepared": self.prepared,
                 "state": "stopping" if self.stopping.is_set()
                 else ("running" if self.current else "idle"),
@@ -386,6 +387,10 @@ class Supervisor:
         AX's runner sends SIGTERM and kills what is left ten seconds later, so
         the record goes to disk before anything that can take time.
         """
+        # A process-group stop can be pending in the forked child when its
+        # mask is cleared before exec. Only the supervisor may handle it.
+        if os.getpid() != self.pid:
+            return
         self.stopping.set()
         run_id, child = self.current, self.child
         if run_id:

@@ -226,6 +226,30 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("running", statuses[statuses.index("interrupted"):])
         self.assertTrue(stop_signals <= heartbeat_mask)
 
+    def test_pending_child_signal_does_not_interrupt_supervisor_record(self):
+        sb = Sandbox(self)
+        run_id = "t-child-signal"
+        sb.request(run_id)
+        supervisor = agent.Supervisor(sb.state)
+        old_handler = signal.signal(signal.SIGTERM, supervisor.on_signal)
+        self.addCleanup(signal.signal, signal.SIGTERM, old_handler)
+        popen = subprocess.Popen
+
+        def launch(*args, preexec_fn, **kwargs):
+            def before_exec():
+                # Model a process-group stop pending in the child from before setsid().
+                os.kill(os.getpid(), signal.SIGTERM)
+                preexec_fn()
+
+            return popen(*args, preexec_fn=before_exec, **kwargs)
+
+        with (patch.dict(os.environ, sb.env),
+              patch.object(agent.subprocess, "Popen", side_effect=launch)):
+            supervisor.execute(run_id)
+
+        record = sb.run_record(run_id)
+        self.assertEqual((record["status"], record["exitCode"]), ("succeeded", 0))
+
     def test_terminal_record_is_never_downgraded(self):
         sb = Sandbox(self)
         run_id = "t-terminal"
