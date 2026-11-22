@@ -393,6 +393,12 @@ class CliConfigTests(unittest.TestCase):
         path.write_text(text)
         return path
 
+    def test_example_config_and_referenced_docs_exist(self):
+        cfg = cli.load_config(ROOT / "examples" / "minimal" / "ax-orbi.toml")
+        kinds = [line for line in cli.render(cfg).splitlines() if line.startswith("kind: ")]
+        self.assertEqual(kinds, ['kind: "Gateway"', 'kind: "Workspace"', 'kind: "Task"'])
+        self.assertTrue((ROOT / "docs" / "SETUP.md").is_file())
+
     def test_render_has_no_secrets_and_binds_everything(self):
         cfg = cli.load_config(self.write(CONFIG))
         gateway, workspace, task = cli.manifests(cfg)
