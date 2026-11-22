@@ -15,9 +15,12 @@ Guarantees, enforced here rather than by whoever operates the sandbox:
 - One supervisor per workspace (flock on serve.lock).
 - One execution per request id. A request file is created with O_EXCL; a
   request that already has a run record is never started again.
+- Once the supervisor handles SIGTERM or SIGINT, it starts no more ticks;
+  requests that have not started stay queued.
 - A run that was in flight when the sandbox stopped is recorded as
-  `interrupted`, with its log kept. It is not re-run. Orbi's own state lives
-  in GitHub labels, so the next tick resumes that delivery.
+  `interrupted`, with its log kept. It never returns to `running` and is not
+  re-run. Orbi's own state lives in GitHub labels, so the next tick resumes
+  that delivery. No run is left `running` on a graceful supervisor exit.
 
 Standard library only.
 """
@@ -45,6 +48,7 @@ EXIT_USAGE = 2
 EXIT_BUSY = 75  # another supervisor already owns this workspace
 
 TERMINAL = ("succeeded", "failed", "interrupted")
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -311,6 +315,14 @@ def load_run(sdir: Path, run_id: str) -> dict | None:
     return read_json(run_path(sdir, run_id) / "run.json")
 
 
+def update_run(sdir: Path, run_id: str, **changes) -> None:
+    run = load_run(sdir, run_id)
+    if run is None or (run.get("status") in TERMINAL and changes.get("status") == "running"):
+        return
+    run.update(changes)
+    write_json(run_path(sdir, run_id) / "run.json", run)
+
+
 def run_summary(sdir: Path, run_id: str) -> dict:
     run = load_run(sdir, run_id)
     if run is None:
@@ -334,10 +346,10 @@ def mark_interrupted(sdir: Path, boot_id: str) -> list[str]:
     for run_id in all_run_ids(sdir):
         run = load_run(sdir, run_id)
         if run and run.get("status") == "running" and run.get("bootId") != boot_id:
-            run.update(status="interrupted", finishedAt=now(), recoveredAtBoot=boot_id,
+            update_run(sdir, run_id, status="interrupted", finishedAt=now(),
+                       recoveredAtBoot=boot_id,
                        detail="the sandbox stopped while this tick was running; "
                               "it is not re-run. The next tick lets Orbi resume the delivery.")
-            write_json(run_path(sdir, run_id) / "run.json", run)
             recovered.append(run_id)
     return recovered
 
@@ -345,6 +357,7 @@ def mark_interrupted(sdir: Path, boot_id: str) -> list[str]:
 class Supervisor:
     def __init__(self, sdir: Path):
         self.sdir = sdir
+        self.pid = os.getpid()
         self.boot_id = uuid.uuid4().hex[:12]
         self.started = now()
         self.stopping = threading.Event()
@@ -354,7 +367,7 @@ class Supervisor:
         self.lock = threading.Lock()
 
     def health(self) -> dict:
-        return {"version": STATE_VERSION, "pid": os.getpid(), "bootId": self.boot_id,
+        return {"version": STATE_VERSION, "pid": self.pid, "bootId": self.boot_id,
                 "startedAt": self.started, "updatedAt": now(), "prepared": self.prepared,
                 "state": "stopping" if self.stopping.is_set()
                 else ("running" if self.current else "idle"),
@@ -374,16 +387,19 @@ class Supervisor:
         AX's runner sends SIGTERM and kills what is left ten seconds later, so
         the record goes to disk before anything that can take time.
         """
+        # A process-group stop can be pending in the forked child when its
+        # mask is cleared before exec. Only the supervisor may handle it.
+        if os.getpid() != self.pid:
+            return
         self.stopping.set()
         run_id, child = self.current, self.child
         if run_id:
-            run = load_run(self.sdir, run_id) or {"id": run_id}
-            if run.get("status") == "running":
-                run.update(status="interrupted", finishedAt=now(),
+            run = load_run(self.sdir, run_id)
+            if run and run.get("status") == "running":
+                update_run(self.sdir, run_id, status="interrupted", finishedAt=now(),
                            signal=signal.Signals(signum).name,
                            detail="stopped by the sandbox (suspend or stop) while running; "
                                   "it is not re-run. The next tick lets Orbi resume the delivery.")
-                write_json(run_path(self.sdir, run_id) / "run.json", run)
         if child and child.poll() is None:
             try:
                 os.killpg(child.pid, signal.SIGTERM)
@@ -391,55 +407,67 @@ class Supervisor:
                 pass
 
     def execute(self, run_id: str) -> None:
-        rdir = run_path(self.sdir, run_id)
-        rdir.mkdir(parents=True, exist_ok=True)
-        request = read_json(self.sdir / "requests" / f"{run_id}.json") or {}
-        cfg = load_config()
-        orbi = os.environ.get("AX_ORBI_ORBI_BIN", "orbi")
-        run = {"version": STATE_VERSION, "id": run_id, "status": "running",
-               "requestedAt": request.get("requestedAt"), "startedAt": now(),
-               "bootId": self.boot_id, "command": [orbi], "log": str(rdir / "tick.log"),
-               "image": image_versions()}
-        log = open(rdir / "tick.log", "ab")
+        log = None
         try:
-            # run.json exists before the process does: a crash in between
-            # leaves a `running` record that the next start closes out, never
-            # an execution with no record.
-            write_json(rdir / "run.json", run)
-            self.current = run_id
-            self.beat()
+            # A pending stop must see either no launch or a fully registered child.
+            old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
             try:
-                self.child = subprocess.Popen(
-                    [orbi], cwd=cfg["deploy_home"], env=child_env(self.sdir),
-                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    start_new_session=True)
-            except OSError as exc:
-                run.update(status="failed", finishedAt=now(), exitCode=127,
-                           detail=f"could not start {orbi}: {exc}")
-                write_json(rdir / "run.json", run)
-                return
-            run["pid"] = self.child.pid
-            write_json(rdir / "run.json", run)
+                if self.stopping.is_set():
+                    return
+                print(f"ax-orbi-agent: tick {run_id} starting", flush=True)
+                rdir = run_path(self.sdir, run_id)
+                rdir.mkdir(parents=True, exist_ok=True)
+                request = read_json(self.sdir / "requests" / f"{run_id}.json") or {}
+                cfg = load_config()
+                orbi = os.environ.get("AX_ORBI_ORBI_BIN", "orbi")
+                log = open(rdir / "tick.log", "ab")
+                # Record the run before launch so even a crash leaves evidence.
+                write_json(rdir / "run.json", {
+                    "version": STATE_VERSION, "id": run_id, "status": "running",
+                    "requestedAt": request.get("requestedAt"), "startedAt": now(),
+                    "bootId": self.boot_id, "command": [orbi], "log": str(rdir / "tick.log"),
+                    "image": image_versions()})
+                self.current = run_id
+                self.beat()
+                try:
+                    self.child = subprocess.Popen(
+                        [orbi], cwd=cfg["deploy_home"], env=child_env(self.sdir),
+                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                        # Clear the inherited mask so Orbi can receive SIGTERM.
+                        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, ()))
+                except OSError as exc:
+                    update_run(self.sdir, run_id, status="failed", finishedAt=now(), exitCode=127,
+                               detail=f"could not start {orbi}: {exc}")
+                    return
+                update_run(self.sdir, run_id, pid=self.child.pid)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
             code = self.child.wait()
         finally:
-            log.close()
+            if log is not None:
+                log.close()
             self.child = None
             self.current = None
-        latest = load_run(self.sdir, run_id) or run
-        latest["exitCode"] = code
-        if latest.get("status") == "running" and not self.stopping.is_set():
-            latest["finishedAt"] = now()
-            if code == 0:
-                latest.update(status="succeeded", detail="the Orbi tick exited 0")
-            elif code < 0:
-                latest.update(status="failed", signal=signal.Signals(-code).name,
-                              detail=f"the Orbi tick was killed by {signal.Signals(-code).name}")
-            else:
-                latest.update(status="failed", detail=f"the Orbi tick exited {code}; see the log")
+
+        # The handler no longer owns this record once current has been cleared.
+        changes = {"exitCode": code}
         health = read_json(Path(cfg["repo_dir"]) / ".orbi" / "health.json")
         if health:
-            latest["orbiHealth"] = health
-        write_json(rdir / "run.json", latest)
+            changes["orbiHealth"] = health
+        latest = load_run(self.sdir, run_id)
+        if latest and latest.get("status") == "running":
+            changes["finishedAt"] = now()
+            if self.stopping.is_set():
+                changes["status"] = "interrupted"
+            elif code == 0:
+                changes.update(status="succeeded", detail="the Orbi tick exited 0")
+            elif code < 0:
+                changes.update(status="failed", signal=signal.Signals(-code).name,
+                               detail=f"the Orbi tick was killed by {signal.Signals(-code).name}")
+            else:
+                changes.update(status="failed", detail=f"the Orbi tick exited {code}; see the log")
+        update_run(self.sdir, run_id, **changes)
         self.beat()
 
     def next_request(self) -> str | None:
@@ -459,8 +487,8 @@ class Supervisor:
                       file=sys.stderr)
                 return EXIT_BUSY
             raise
-        signal.signal(signal.SIGTERM, self.on_signal)
-        signal.signal(signal.SIGINT, self.on_signal)
+        for signum in STOP_SIGNALS:
+            signal.signal(signum, self.on_signal)
 
         for sub in ("requests", "runs"):
             (self.sdir / sub).mkdir(parents=True, exist_ok=True)
@@ -479,7 +507,13 @@ class Supervisor:
         print(f"ax-orbi-agent: prepared={'ok' if self.prepared else 'FAILED'} boot={self.boot_id}; "
               "waiting for tick requests", flush=True)
         self.beat()
-        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+        # Only the main thread should receive stop signals. The heartbeat
+        # inherits this mask and keeps the signals blocked for its lifetime.
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        try:
+            threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
 
         while not self.stopping.is_set():
             run_id = self.next_request()
@@ -497,11 +531,11 @@ class Supervisor:
                     "startedAt": now(), "finishedAt": now(), "bootId": self.boot_id,
                     "detail": "not started: the environment is not prepared (see prepare.json)"})
                 continue
-            print(f"ax-orbi-agent: tick {run_id} starting", flush=True)
             self.execute(run_id)
-            done = load_run(self.sdir, run_id) or {}
-            print(f"ax-orbi-agent: tick {run_id} {done.get('status')} exit={done.get('exitCode')}",
-                  flush=True)
+            done = load_run(self.sdir, run_id)
+            if done:
+                print(f"ax-orbi-agent: tick {run_id} {done.get('status')} exit={done.get('exitCode')}",
+                      flush=True)
         self.beat()
         return EXIT_OK
 
