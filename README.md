@@ -25,6 +25,10 @@ GitHub Actions runs offline tests and syntax checks on every push to `main` and 
 
 The existing verifier can fail in phase 5 with `Orbi rejected the generated configuration` after GitHub rejects the verifier's placeholder credentials. This is not an error in your TOML; the verifier does not read your deployment config or Secrets.
 
+## Install the skill
+
+Import or copy the entire [`skills/ax-orbi/`](skills/ax-orbi/) directory into your agent's skills location using its Agent Skills installation instructions. The [operator skill](skills/ax-orbi/SKILL.md) also needs shell access on the AX CLI host and a checkout of this repository; installing the skill doesn't grant AX access. Use the [setup guide](docs/SETUP.md) to configure a deployment.
+
 ## CLI
 
 Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `-c` / `--config` (default `./ax-orbi.toml`) and `--json`.
@@ -34,13 +38,13 @@ Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `-c` / `
 | `check` | Checks prerequisites, version pins and the deployment configuration. |
 | `build` | Builds the task image from `versions.toml` and optionally pushes it. |
 | `render` | Prints the deployment's AX manifests. |
-| `prepare` | Creates and starts the sandbox without starting a delivery. |
+| `prepare` | Creates, starts or resumes the sandbox without requesting a new tick. |
 | `run` | Requests one Orbi tick and waits for the result by default. |
 | `inspect` | Reports sandbox health, recent runs and their evidence. |
 | `stop` | Checkpoints the sandbox, keeping state by default. |
 | `recover` | Resumes a checkpointed sandbox and reports interrupted runs. |
 
-Exit codes: `0` success, `1` check or run failed, `2` bad usage or configuration, `3` a run was interrupted or its outcome is unknown.
+Exit codes: `0` command succeeded (possibly with warnings), `1` operation, check or tick failed, `2` bad usage or configuration, `3` interrupted, pending or unknown outcome. `check --json` lists warnings in `unverified`; it checks digest syntax (`image-pinned`), not the running image's `image-pins`. See [Interpreting results](docs/SETUP.md#interpreting-results) for the `taskState` classes, pin verification and what `executionUnknown` means after a forced stop.
 
 ## Limits
 

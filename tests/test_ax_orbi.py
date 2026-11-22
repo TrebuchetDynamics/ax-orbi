@@ -7,8 +7,10 @@ as separate processes.
 
     python3 -m unittest discover -s tests -v
 """
+import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -390,6 +392,37 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(code, 1)
         failed = [c["name"] for c in json.loads(out)["checks"] if not c["ok"]]
         self.assertEqual(failed, ["origin"])
+
+
+class SkillTests(unittest.TestCase):
+    skill = ROOT / "skills" / "ax-orbi" / "SKILL.md"
+
+    def test_skill_frontmatter(self):
+        # The bundled file uses a plain name and a single-line quoted YAML scalar.
+        text = self.skill.read_text(encoding="utf-8")
+        header = re.match(r"\A---\nname: ([a-z0-9-]+)\ndescription: '([^'\n]*)'\n---\n", text)
+        self.assertIsNotNone(header, "expected YAML frontmatter with name and description")
+        name, description = header.groups()
+        self.assertEqual(name, "ax-orbi")
+        self.assertTrue(description.strip())
+        self.assertLessEqual(len(description), 1024)
+
+    def test_skill_commands_exist(self):
+        text = self.skill.read_text(encoding="utf-8")
+        parser = cli.build_parser()
+        commands = next(a.choices for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        options = {name: {option for action in sub._actions for option in action.option_strings}
+                   for name, sub in commands.items()}
+        long_option = r"(?<![\w-])--\w[\w-]*"
+        # Check standalone option mentions and command examples, even in prose.
+        self.assertEqual(set(re.findall(long_option, text)) - set().union(*options.values()), set())
+        examples = re.findall(r"(?<![\w-])ax-orbi[ \t]+([\w-]+)([^`\n;&|]*)", text)
+        self.assertTrue(examples, "no ax-orbi commands found in the skill")
+        for name, args in examples:
+            with self.subTest(command=name, args=args):
+                self.assertIn(name, commands)
+                for option in re.findall(long_option, args):
+                    self.assertIn(option, options[name])
 
 
 class CliConfigTests(unittest.TestCase):
