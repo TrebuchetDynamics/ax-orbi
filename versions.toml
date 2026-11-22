@@ -1,0 +1,29 @@
+# The tested combination. `ax-orbi build` passes these to image/Dockerfile and
+# `ax-orbi check` compares the host's tools against them. Change a pin, then
+# re-run `make verify` before using the result.
+
+[ax]
+# google/ax has no published runner image, so the image builds ax-runner from
+# this commit. Build the `ax` CLI and ax-server from the SAME commit: the
+# runner contract (how a task reaches the runner) changes between commits.
+repo = "https://github.com/google/ax.git"
+ref = "2ede873cb5a1a519c0b5adf2adc8e97fe80ca1d2"
+
+[orbi]
+repo = "https://github.com/orbi-build/orbi.git"
+tag = "v0.7.61"
+commit = "f4a2ef5ab8c33cc4128447457bbb5ca88cc08342"
+
+[pi]
+package = "@earendil-works/pi-coding-agent"
+version = "1.6.0"
+
+[gh]
+version = "2.104.0"
+sha256_amd64 = "98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e"
+sha256_arm64 = "cb34cefc6f4e77b90731374a2b737516bb8f3033c6ca46aa949e5344f68069e3"
+
+[base_images]
+python = "python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f"
+golang = "golang:1.27-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea"
+node = "node:22.23.5-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee"

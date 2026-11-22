@@ -1,0 +1,13 @@
+#!/bin/bash
+# Test stand-in for the Orbi CLI. Its behaviour for a tick comes from the file
+# $FAKE_ORBI_MODE_FILE: ok | fail | hang. Every tick appends to $FAKE_ORBI_LOG,
+# which is how tests count executions.
+if [ "${1:-}" = "--version" ]; then echo "orbi 0.0.0-fake"; exit 0; fi
+mode=$(cat "${FAKE_ORBI_MODE_FILE:-/nonexistent}" 2>/dev/null || echo ok)
+echo "tick mode=$mode config=$ORBI_CONFIG home=$HOME" >> "${FAKE_ORBI_LOG:-/dev/null}"
+echo "fake orbi tick: mode=$mode"
+case "$mode" in
+  ok) echo "poll_done reason=no_ready_issue"; exit 0 ;;
+  fail) echo "runner failed: simulated" >&2; exit 1 ;;
+  hang) echo "working"; trap 'echo got-sigterm; exit 143' TERM; while :; do sleep 0.2; done ;;
+esac

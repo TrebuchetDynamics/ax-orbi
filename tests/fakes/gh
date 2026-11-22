@@ -1,0 +1,2 @@
+#!/bin/sh
+case "$1" in --version) echo "gh version 0.0.0-fake";; auth) exit 0;; esac

@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""ax-orbi-agent: runs inside the AX sandbox and owns Orbi's lifecycle there.
+
+`serve` is the task's spec.commands. It prepares the environment, then waits
+for tick requests and runs each one as a single Orbi tick. It never starts a
+delivery on its own. Everything it knows is written under the state directory
+on the durable /workspace volume, so a suspend, a crash or a container restart
+loses no evidence.
+
+The other subcommands (`request-tick`, `status`, `logs`) are short, read or
+write only the state directory, and are what the host reaches over `ax ssh`.
+
+Guarantees, enforced here rather than by whoever operates the sandbox:
+
+- One supervisor per workspace (flock on serve.lock).
+- One execution per request id. A request file is created with O_EXCL; a
+  request that already has a run record is never started again.
+- A run that was in flight when the sandbox stopped is recorded as
+  `interrupted`, with its log kept. It is not re-run. Orbi's own state lives
+  in GitHub labels, so the next tick resumes that delivery.
+
+Standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import errno
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+
+STATE_VERSION = 1
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_BUSY = 75  # another supervisor already owns this workspace
+
+TERMINAL = ("succeeded", "failed", "interrupted")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("AX_ORBI_STATE_DIR", "/workspace/.ax-orbi"))
+
+
+def write_json(path: Path, data: dict) -> None:
+    """Atomic replace, flushed to disk: a reader never sees a torn file and a
+    snapshot taken right after never misses it."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        return {"_unreadable": f"{path.name}: {exc}"}
+
+
+def tail(path: Path, lines: int) -> list[str]:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 256 * 1024))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return text.splitlines()[-lines:]
+
+
+# ---- configuration ---------------------------------------------------------
+
+class ConfigError(Exception):
+    pass
+
+
+def load_config() -> dict:
+    """The deployment config the host rendered into the task's environment.
+
+    It holds no secrets: credentials are placeholders that the AX gateway
+    replaces outside the sandbox.
+    """
+    raw = os.environ.get("AX_ORBI_CONFIG")
+    if not raw:
+        raise ConfigError("AX_ORBI_CONFIG is not set; this task was not rendered by ax-orbi")
+    try:
+        cfg = json.loads(raw)
+    except ValueError as exc:
+        raise ConfigError(f"AX_ORBI_CONFIG is not valid JSON: {exc}") from None
+    if not isinstance(cfg, dict):
+        raise ConfigError("AX_ORBI_CONFIG must be a JSON object")
+    repo = cfg.get("source_repo", "")
+    if not isinstance(repo, str) or not REPO_RE.match(repo):
+        raise ConfigError(f"source_repo must be OWNER/REPO, got {repo!r}")
+    branch = cfg.setdefault("base_branch", "main")
+    if not isinstance(branch, str) or not BRANCH_RE.match(branch):
+        raise ConfigError(f"invalid base_branch {branch!r}")
+    cfg.setdefault("repo_dir", "/workspace/repo")
+    cfg.setdefault("deploy_home", "/opt/orbi")
+    cfg.setdefault("orbi", {})
+    return cfg
+
+
+def toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)  # a JSON string is a valid TOML basic string
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return "[" + ", ".join(json.dumps(v) for v in value) + "]"
+    raise ConfigError(f"unsupported orbi setting value {value!r}")
+
+
+def image_versions() -> dict:
+    path = Path(os.environ.get("AX_ORBI_VERSIONS_FILE", "/etc/ax-orbi/versions.json"))
+    return read_json(path) or {}
+
+
+def render_orbi_toml(cfg: dict, sdir: Path) -> str:
+    settings: dict = {
+        "source_repos": [cfg["source_repo"]],
+        "repo_dir": cfg["repo_dir"],
+        "deploy_home": cfg["deploy_home"],
+        "workspace_root": str(Path(cfg["repo_dir"]).parent),
+        "base_branch": cfg["base_branch"],
+        "git_transport": "https",
+        "max_concurrency": 1,
+    }
+    tag = image_versions().get("orbi_tag")
+    if tag:
+        # The image carries exactly this tag; Orbi verifies it before a claim.
+        settings["engine_source_track"] = f"tag:{tag}"
+    pi = cfg.get("pi") or {}
+    if pi:
+        settings["pi_providers"] = str(sdir / "pi-providers.json")
+        settings["pi_provider"] = pi["provider"]
+        settings["pi_model"] = pi["model"]
+    reserved = set(settings)
+    for key, value in (cfg.get("orbi") or {}).items():
+        if key in reserved:
+            raise ConfigError(f"[orbi] may not override {key!r}; ax-orbi sets it")
+        settings[key] = value
+    lines = ["# Generated by ax-orbi-agent at every start. Edit the deployment",
+             "# config on the host instead; this file is overwritten."]
+    lines += [f"{key} = {toml_value(value)}" for key, value in settings.items()]
+    return "\n".join(lines) + "\n"
+
+
+def render_pi_providers(cfg: dict) -> dict | None:
+    pi = cfg.get("pi") or {}
+    if not pi:
+        return None
+    for key in ("provider", "model", "base_url"):
+        if not pi.get(key):
+            raise ConfigError(f"pi.{key} is required when a model is configured")
+    return {"providers": {pi["provider"]: {
+        "baseUrl": pi["base_url"],
+        "api": pi.get("api", "openai-completions"),
+        # Resolved from the environment; the value there is a placeholder.
+        "apiKey": "$PI_API_KEY",
+        "models": [{
+            "id": pi["model"], "name": pi["model"],
+            "contextWindow": int(pi.get("context_window", 128000)),
+            "maxTokens": int(pi.get("max_tokens", 16384)),
+        }],
+    }}}
+
+
+def child_env(sdir: Path) -> dict:
+    env = dict(os.environ)
+    # HOME on the durable volume: gh, git and Pi keep their config and
+    # sessions across a suspend. The container's own home is thrown away.
+    env["HOME"] = str(sdir / "home")
+    env["ORBI_CONFIG"] = str(sdir / "orbi.toml")
+    env.pop("AX_ORBI_CONFIG", None)
+    return env
+
+
+# ---- prepare ---------------------------------------------------------------
+
+def run_quiet(cmd: list[str], env: dict, cwd: str | None = None, timeout: int = 60):
+    try:
+        proc = subprocess.run(cmd, env=env, cwd=cwd, timeout=timeout,
+                              capture_output=True, text=True)
+        return proc.returncode, (proc.stdout + proc.stderr).strip()
+    except FileNotFoundError:
+        return 127, f"{cmd[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, f"{' '.join(cmd)}: timed out after {timeout}s"
+
+
+def prepare(sdir: Path) -> dict:
+    """Make the environment ready for a tick, without starting one.
+
+    Idempotent: runs at every start. Returns the report it also writes to
+    prepare.json; `ok` is False when a tick could not possibly work.
+    """
+    checks: list[dict] = []
+
+    def check(name: str, ok: bool, detail: str, fix: str = "") -> bool:
+        entry = {"name": name, "ok": ok, "detail": detail}
+        if fix and not ok:
+            entry["fix"] = fix
+        checks.append(entry)
+        return ok
+
+    report = {"version": STATE_VERSION, "at": now(), "ok": False, "checks": checks,
+              "image": image_versions()}
+    try:
+        cfg = load_config()
+    except ConfigError as exc:
+        check("config", False, str(exc), "re-render the task with `ax-orbi prepare`")
+        write_json(sdir / "prepare.json", report)
+        return report
+    check("config", True, f"{cfg['source_repo']} @ {cfg['base_branch']}")
+
+    for sub in ("home", "requests", "runs"):
+        (sdir / sub).mkdir(parents=True, exist_ok=True)
+    env = child_env(sdir)
+
+    try:
+        (sdir / "orbi.toml").write_text(render_orbi_toml(cfg, sdir), encoding="utf-8")
+        providers = render_pi_providers(cfg)
+        if providers is not None:
+            write_json(sdir / "pi-providers.json", providers)
+        check("orbi-config", True, str(sdir / "orbi.toml"))
+    except (ConfigError, KeyError) as exc:
+        check("orbi-config", False, f"cannot render orbi.toml: {exc}",
+              "fix the [model] or [orbi] section of the deployment config")
+
+    orbi = os.environ.get("AX_ORBI_ORBI_BIN", "orbi")
+    for name, cmd in (("orbi", [orbi, "--version"]), ("pi", ["pi", "--version"]),
+                      ("gh", ["gh", "--version"]), ("git", ["git", "--version"])):
+        code, out = run_quiet(cmd, env)
+        check(f"tool:{name}", code == 0, out.splitlines()[0] if out else f"exit {code}",
+              "the image is incomplete; rebuild it with `ax-orbi build`")
+
+    repo_dir = Path(cfg["repo_dir"])
+    code, out = run_quiet(["git", "-C", str(repo_dir), "rev-parse", "HEAD"], env)
+    if check("checkout", code == 0, f"{repo_dir} at {out[:12]}" if code == 0 else out,
+             "the Workspace did not clone the repository: check `ax describe workspace`, "
+             "the repository URL, and that the gateway allows github.com"):
+        # Orbi keeps slot locks in <repo>/.orbi and worktrees in <repo>/.worktrees;
+        # neither may show up as a dirty checkout.
+        exclude = repo_dir / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        have = exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
+        missing = [line for line in (".orbi/", ".worktrees/") if line not in have]
+        if missing:
+            with open(exclude, "a", encoding="utf-8") as fh:
+                fh.write("".join(f"{line}\n" for line in missing))
+        code, out = run_quiet(["git", "-C", str(repo_dir), "remote", "get-url", "origin"], env)
+        want = f"github.com/{cfg['source_repo']}"
+        origin = out.strip().lower().removesuffix("/").removesuffix(".git")
+        check("origin", code == 0 and origin.endswith("/" + want.lower()),
+              out or "no origin remote",
+              f"the checkout's origin must be https://{want}.git")
+
+    if env.get("GH_TOKEN"):
+        # Route git over HTTPS through gh, Orbi's token-only transport.
+        code, out = run_quiet(["gh", "auth", "setup-git"], env)
+        check("git-credentials", code == 0, "gh credential helper configured" if code == 0 else out,
+              "GH_TOKEN must be set (a placeholder is enough behind the gateway)")
+    else:
+        check("git-credentials", False, "GH_TOKEN is not set",
+              "set [credentials.github] in the deployment config")
+
+    report["ok"] = all(c["ok"] for c in checks)
+    write_json(sdir / "prepare.json", report)
+    return report
+
+
+# ---- runs ------------------------------------------------------------------
+
+def run_path(sdir: Path, run_id: str) -> Path:
+    return sdir / "runs" / run_id
+
+
+def load_run(sdir: Path, run_id: str) -> dict | None:
+    return read_json(run_path(sdir, run_id) / "run.json")
+
+
+def run_summary(sdir: Path, run_id: str) -> dict:
+    run = load_run(sdir, run_id)
+    if run is None:
+        req = read_json(sdir / "requests" / f"{run_id}.json") or {}
+        return {"id": run_id, "status": "queued", "requestedAt": req.get("requestedAt")}
+    return run
+
+
+def all_run_ids(sdir: Path) -> list[str]:
+    """Every request ever made, oldest first."""
+    entries = []
+    for path in (sdir / "requests").glob("*.json"):
+        req = read_json(path) or {}
+        entries.append((req.get("requestedAt") or "", path.stem))
+    return [run_id for _, run_id in sorted(entries)]
+
+
+def mark_interrupted(sdir: Path, boot_id: str) -> list[str]:
+    """Close out runs left `running` by a supervisor that no longer exists."""
+    recovered = []
+    for run_id in all_run_ids(sdir):
+        run = load_run(sdir, run_id)
+        if run and run.get("status") == "running" and run.get("bootId") != boot_id:
+            run.update(status="interrupted", finishedAt=now(), recoveredAtBoot=boot_id,
+                       detail="the sandbox stopped while this tick was running; "
+                              "it is not re-run. The next tick lets Orbi resume the delivery.")
+            write_json(run_path(sdir, run_id) / "run.json", run)
+            recovered.append(run_id)
+    return recovered
+
+
+class Supervisor:
+    def __init__(self, sdir: Path):
+        self.sdir = sdir
+        self.boot_id = uuid.uuid4().hex[:12]
+        self.started = now()
+        self.stopping = threading.Event()
+        self.child: subprocess.Popen | None = None
+        self.current: str | None = None
+        self.prepared = False
+        self.lock = threading.Lock()
+
+    def health(self) -> dict:
+        return {"version": STATE_VERSION, "pid": os.getpid(), "bootId": self.boot_id,
+                "startedAt": self.started, "updatedAt": now(), "prepared": self.prepared,
+                "state": "stopping" if self.stopping.is_set()
+                else ("running" if self.current else "idle"),
+                "currentRun": self.current}
+
+    def beat(self) -> None:
+        with self.lock:
+            write_json(self.sdir / "health.json", self.health())
+
+    def heartbeat_loop(self) -> None:
+        while not self.stopping.wait(5):
+            self.beat()
+
+    def on_signal(self, signum, _frame) -> None:
+        """Stop or suspend: record the interruption first, then stop the tick.
+
+        AX's runner sends SIGTERM and kills what is left ten seconds later, so
+        the record goes to disk before anything that can take time.
+        """
+        self.stopping.set()
+        run_id, child = self.current, self.child
+        if run_id:
+            run = load_run(self.sdir, run_id) or {"id": run_id}
+            if run.get("status") == "running":
+                run.update(status="interrupted", finishedAt=now(),
+                           signal=signal.Signals(signum).name,
+                           detail="stopped by the sandbox (suspend or stop) while running; "
+                                  "it is not re-run. The next tick lets Orbi resume the delivery.")
+                write_json(run_path(self.sdir, run_id) / "run.json", run)
+        if child and child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    def execute(self, run_id: str) -> None:
+        rdir = run_path(self.sdir, run_id)
+        rdir.mkdir(parents=True, exist_ok=True)
+        request = read_json(self.sdir / "requests" / f"{run_id}.json") or {}
+        cfg = load_config()
+        orbi = os.environ.get("AX_ORBI_ORBI_BIN", "orbi")
+        run = {"version": STATE_VERSION, "id": run_id, "status": "running",
+               "requestedAt": request.get("requestedAt"), "startedAt": now(),
+               "bootId": self.boot_id, "command": [orbi], "log": str(rdir / "tick.log"),
+               "image": image_versions()}
+        log = open(rdir / "tick.log", "ab")
+        try:
+            # run.json exists before the process does: a crash in between
+            # leaves a `running` record that the next start closes out, never
+            # an execution with no record.
+            write_json(rdir / "run.json", run)
+            self.current = run_id
+            self.beat()
+            try:
+                self.child = subprocess.Popen(
+                    [orbi], cwd=cfg["deploy_home"], env=child_env(self.sdir),
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    start_new_session=True)
+            except OSError as exc:
+                run.update(status="failed", finishedAt=now(), exitCode=127,
+                           detail=f"could not start {orbi}: {exc}")
+                write_json(rdir / "run.json", run)
+                return
+            run["pid"] = self.child.pid
+            write_json(rdir / "run.json", run)
+            code = self.child.wait()
+        finally:
+            log.close()
+            self.child = None
+            self.current = None
+        latest = load_run(self.sdir, run_id) or run
+        latest["exitCode"] = code
+        if latest.get("status") == "running" and not self.stopping.is_set():
+            latest["finishedAt"] = now()
+            if code == 0:
+                latest.update(status="succeeded", detail="the Orbi tick exited 0")
+            elif code < 0:
+                latest.update(status="failed", signal=signal.Signals(-code).name,
+                              detail=f"the Orbi tick was killed by {signal.Signals(-code).name}")
+            else:
+                latest.update(status="failed", detail=f"the Orbi tick exited {code}; see the log")
+        health = read_json(Path(cfg["repo_dir"]) / ".orbi" / "health.json")
+        if health:
+            latest["orbiHealth"] = health
+        write_json(rdir / "run.json", latest)
+        self.beat()
+
+    def next_request(self) -> str | None:
+        for run_id in all_run_ids(self.sdir):
+            if not (run_path(self.sdir, run_id) / "run.json").exists():
+                return run_id
+        return None
+
+    def serve(self) -> int:
+        self.sdir.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(self.sdir / "serve.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EACCES):
+                print("ax-orbi-agent: another supervisor owns this workspace; not starting a second",
+                      file=sys.stderr)
+                return EXIT_BUSY
+            raise
+        signal.signal(signal.SIGTERM, self.on_signal)
+        signal.signal(signal.SIGINT, self.on_signal)
+
+        for sub in ("requests", "runs"):
+            (self.sdir / sub).mkdir(parents=True, exist_ok=True)
+        recovered = mark_interrupted(self.sdir, self.boot_id)
+        for run_id in recovered:
+            print(f"ax-orbi-agent: run {run_id} was interrupted by the last stop; kept, not re-run",
+                  flush=True)
+        report = prepare(self.sdir)
+        self.prepared = report["ok"]
+        for item in report["checks"]:
+            if not item["ok"]:
+                print(f"ax-orbi-agent: prepare: {item['name']}: {item['detail']}", flush=True)
+        print(f"ax-orbi-agent: prepared={'ok' if self.prepared else 'FAILED'} boot={self.boot_id}; "
+              "waiting for tick requests", flush=True)
+        self.beat()
+        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+
+        while not self.stopping.is_set():
+            run_id = self.next_request()
+            if run_id is None:
+                self.stopping.wait(1)
+                continue
+            if not self.prepared:
+                # Re-check instead of refusing forever: the cause may be gone.
+                self.prepared = prepare(self.sdir)["ok"]
+            if not self.prepared:
+                rdir = run_path(self.sdir, run_id)
+                rdir.mkdir(parents=True, exist_ok=True)
+                write_json(rdir / "run.json", {
+                    "version": STATE_VERSION, "id": run_id, "status": "failed",
+                    "startedAt": now(), "finishedAt": now(), "bootId": self.boot_id,
+                    "detail": "not started: the environment is not prepared (see prepare.json)"})
+                continue
+            print(f"ax-orbi-agent: tick {run_id} starting", flush=True)
+            self.execute(run_id)
+            done = load_run(self.sdir, run_id) or {}
+            print(f"ax-orbi-agent: tick {run_id} {done.get('status')} exit={done.get('exitCode')}",
+                  flush=True)
+        self.beat()
+        return EXIT_OK
+
+
+# ---- commands the host calls -----------------------------------------------
+
+def supervisor_alive(sdir: Path) -> bool:
+    """True when a live process holds serve.lock. The lock is the truth; the
+    heartbeat timestamp is only for display."""
+    try:
+        fd = os.open(sdir / "serve.lock", os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def cmd_request_tick(args) -> int:
+    sdir = state_dir()
+    run_id = args.id or f"tick-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:6]}"
+    if not ID_RE.match(run_id):
+        print(f"invalid run id {run_id!r}", file=sys.stderr)
+        return EXIT_USAGE
+    (sdir / "requests").mkdir(parents=True, exist_ok=True)
+    path = sdir / "requests" / f"{run_id}.json"
+    duplicate = False
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        duplicate = True  # same id: report the existing run, start nothing
+    else:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"id": run_id, "requestedAt": now()}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+    out = {"id": run_id, "duplicate": duplicate, "run": run_summary(sdir, run_id),
+           "supervisorAlive": supervisor_alive(sdir)}
+    print(json.dumps(out, sort_keys=True))
+    return EXIT_OK
+
+
+def collect_status(sdir: Path, run_id: str | None, limit: int) -> dict:
+    ids = all_run_ids(sdir) if (sdir / "requests").is_dir() else []
+    status = {
+        "version": STATE_VERSION, "at": now(), "stateDir": str(sdir),
+        "supervisorAlive": supervisor_alive(sdir),
+        "health": read_json(sdir / "health.json"),
+        "prepare": read_json(sdir / "prepare.json"),
+        "counts": {}, "runs": [],
+    }
+    summaries = [run_summary(sdir, rid) for rid in ids]
+    for summary in summaries:
+        key = summary.get("status", "unknown")
+        status["counts"][key] = status["counts"].get(key, 0) + 1
+    if run_id:
+        if run_id not in ids:
+            status["error"] = f"no such run {run_id}"
+        else:
+            status["runs"] = [run_summary(sdir, run_id)]
+    else:
+        status["runs"] = summaries[-limit:]
+    return status
+
+
+def cmd_status(args) -> int:
+    sdir = state_dir()
+    status = collect_status(sdir, args.run, args.limit)
+    if args.json:
+        print(json.dumps(status, sort_keys=True))
+    else:
+        health = status["health"] or {}
+        prep = status["prepare"] or {}
+        print(f"supervisor: {'alive' if status['supervisorAlive'] else 'NOT RUNNING'} "
+              f"state={health.get('state', '?')} boot={health.get('bootId', '?')}")
+        print(f"prepared:   {'ok' if prep.get('ok') else 'NO'}")
+        for item in prep.get("checks", []):
+            if not item["ok"]:
+                print(f"  - {item['name']}: {item['detail']}")
+                if item.get("fix"):
+                    print(f"    fix: {item['fix']}")
+        for run in status["runs"]:
+            print(f"run {run['id']}: {run.get('status')} exit={run.get('exitCode', '-')} "
+                  f"{run.get('detail', '')}")
+    if status.get("error"):
+        return EXIT_FAILED
+    return EXIT_OK
+
+
+def cmd_logs(args) -> int:
+    sdir = state_dir()
+    path = run_path(sdir, args.run) / "tick.log"
+    if not ID_RE.match(args.run) or not path.exists():
+        print(f"no log for run {args.run!r}", file=sys.stderr)
+        return EXIT_FAILED
+    print("\n".join(tail(path, args.tail)))
+    return EXIT_OK
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="ax-orbi-agent", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("serve", help="prepare, then run tick requests (the task's command)")
+    sub.add_parser("prepare", help="re-run the environment checks and print the report")
+    req = sub.add_parser("request-tick", help="ask the supervisor for one Orbi tick")
+    req.add_argument("--id", help="run id; reusing one never starts a second execution")
+    st = sub.add_parser("status", help="supervisor health, prepare report and runs")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--run", help="show only this run")
+    st.add_argument("--limit", type=int, default=5, help="most recent runs to show")
+    lg = sub.add_parser("logs", help="print the end of a run's log")
+    lg.add_argument("--run", required=True)
+    lg.add_argument("--tail", type=int, default=100)
+    args = parser.parse_args(argv)
+
+    if args.command == "serve":
+        return Supervisor(state_dir()).serve()
+    if args.command == "prepare":
+        sdir = state_dir()
+        sdir.mkdir(parents=True, exist_ok=True)
+        report = prepare(sdir)
+        print(json.dumps(report, sort_keys=True))
+        return EXIT_OK if report["ok"] else EXIT_FAILED
+    if args.command == "request-tick":
+        return cmd_request_tick(args)
+    if args.command == "status":
+        return cmd_status(args)
+    return cmd_logs(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

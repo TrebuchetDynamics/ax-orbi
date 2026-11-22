@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""ax-orbi: run Orbi + Pi inside a Google AX sandbox, one deployment per repository.
+
+  ax-orbi check     prerequisites, version pins and the deployment config
+  ax-orbi build     build the task image from versions.toml (and push it)
+  ax-orbi render    print the AX manifests for a deployment
+  ax-orbi prepare   create and start the sandbox; no delivery is started
+  ax-orbi run       run one Orbi tick and wait for its result
+  ax-orbi inspect   sandbox health, the last runs and their evidence
+  ax-orbi stop      checkpoint the sandbox (state is kept)
+  ax-orbi recover   bring a stopped sandbox back and report what was interrupted
+
+Every command takes -c/--config (default ./ax-orbi.toml) and --json.
+Exit codes: 0 ok, 1 the thing checked or run failed, 2 bad usage or config,
+3 a run was interrupted or its outcome is unknown.
+
+Standard library only; needs Python 3.11+.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+from urllib.parse import urlparse
+
+ROOT = Path(__file__).resolve().parent.parent
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 3
+
+NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,48}[a-z0-9])?$")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+HOST_RE = re.compile(r"^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+SECRET_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?/[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+DIGEST_RE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+SECRET_LOOKING = re.compile(r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})")
+
+GITHUB_OPEN_HOSTS = ["codeload.github.com", "objects.githubusercontent.com",
+                     "raw.githubusercontent.com", "*.githubusercontent.com"]
+
+
+class ConfigError(Exception):
+    pass
+
+
+# ---- configuration ---------------------------------------------------------
+
+def load_versions(path: Path | None = None) -> dict:
+    with open(path or ROOT / "versions.toml", "rb") as fh:
+        return tomllib.load(fh)
+
+
+def load_config(path: Path) -> dict:
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc.strerror}. "
+                          "Copy examples/minimal/ax-orbi.toml and edit it.") from None
+    found = SECRET_LOOKING.search(raw_text)
+    if found:
+        raise ConfigError(f"{path} appears to contain a credential ({found.group(0)[:8]}...). "
+                          "The config only references Kubernetes Secrets; remove the value "
+                          "and rotate it if this file was ever shared.")
+    try:
+        cfg = tomllib.loads(raw_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path}: {exc}") from None
+
+    errors: list[str] = []
+
+    def need(table: dict, key: str, where: str, pattern: re.Pattern | None = None,
+             hint: str = "") -> str:
+        value = table.get(key)
+        if not isinstance(value, str) or not value:
+            errors.append(f"{where}{key} is required{hint}")
+            return ""
+        if pattern and not pattern.match(value):
+            errors.append(f"{where}{key} = {value!r} is not valid{hint}")
+        return value
+
+    need(cfg, "name", "", NAME_RE, " (lowercase letters, digits and '-', at most 50)")
+    repo = cfg.get("repository") or {}
+    need(repo, "source", "repository.", REPO_RE, " (OWNER/REPO)")
+    repo.setdefault("base_branch", "main")
+    image = cfg.get("image") or {}
+    ref = need(image, "ref", "image.")
+    if ref and not DIGEST_RE.match(ref):
+        errors.append("image.ref must be pinned by digest (registry/name@sha256:...); "
+                      "AX rejects tags. `ax-orbi build --push` prints the reference.")
+    res = cfg.setdefault("resources", {})
+    res.setdefault("cpu", "2")
+    res.setdefault("memory", "4Gi")
+
+    creds = cfg.get("credentials") or {}
+    gh = creds.get("github") or {}
+    need(gh, "secret", "credentials.github.", SECRET_RE, " (NAMESPACE/SECRET-NAME)")
+    gh.setdefault("token_key", "token")
+    gh.setdefault("basic_key", "basic")
+
+    model = cfg.get("model")
+    if model is not None:
+        for key in ("provider", "model", "base_url"):
+            need(model, key, "model.")
+        url = urlparse(model.get("base_url", ""))
+        if model.get("base_url") and (url.scheme != "https" or not url.hostname):
+            errors.append("model.base_url must be an https URL")
+        mc = creds.get("model") or {}
+        need(mc, "secret", "credentials.model.", SECRET_RE, " (NAMESPACE/SECRET-NAME)")
+        mc.setdefault("key", "api-key")
+        mc.setdefault("header", "authorization")
+        mc.setdefault("prefix", "Bearer ")
+        creds["model"] = mc
+
+    network = cfg.setdefault("network", {})
+    allow = network.setdefault("allow", [])
+    if not isinstance(allow, list):
+        errors.append("network.allow must be a list of hostnames")
+        allow = []
+    for host in allow:
+        if not isinstance(host, str) or not HOST_RE.match(host):
+            errors.append(f"network.allow: {host!r} is not a lowercase DNS name")
+
+    ax = cfg.setdefault("ax", {})
+    ax.setdefault("atespace", "default")
+    ax.setdefault("bin", "ax")
+    orbi = cfg.setdefault("orbi", {})
+    if not isinstance(orbi, dict):
+        errors.append("[orbi] must be a table of Orbi settings")
+
+    if errors:
+        raise ConfigError(f"{path}:\n  - " + "\n  - ".join(errors))
+    cfg["repository"], cfg["image"], cfg["credentials"] = repo, image, creds
+    cfg["credentials"]["github"] = gh
+    return cfg
+
+
+def names(cfg: dict) -> dict:
+    base = f"orbi-{cfg['name']}"
+    return {"task": base, "workspace": f"{base}-ws", "gateway": f"{base}-gw"}
+
+
+def agent_config(cfg: dict) -> dict:
+    """What the in-sandbox agent receives. No secrets by construction."""
+    out = {"deployment": cfg["name"], "source_repo": cfg["repository"]["source"],
+           "base_branch": cfg["repository"]["base_branch"], "orbi": cfg.get("orbi", {})}
+    model = cfg.get("model")
+    if model:
+        out["pi"] = {k: model[k] for k in
+                     ("provider", "model", "base_url", "api", "context_window", "max_tokens")
+                     if k in model}
+    return out
+
+
+def secret_uri(secret: str, key: str) -> str:
+    namespace, name = secret.split("/")
+    return f"ate-secret://k8s.io/default/{namespace}/{name}/{key}"
+
+
+def manifests(cfg: dict) -> list[dict]:
+    n = names(cfg)
+    atespace = cfg["ax"]["atespace"]
+    creds = cfg["credentials"]
+    gh = creds["github"]
+
+    def inject(host: str, header: str, prefix: str, uri: str) -> dict:
+        return {"https": {"hostnames": [host], "effects": {"replaceHeaders": [
+            {"header": header, "prefix": prefix, "credentialUri": uri}]}}}
+
+    egress = [
+        # git over HTTPS sends Basic auth; gh and the REST/GraphQL API send a
+        # token. Both leave the sandbox as placeholders and are replaced here.
+        inject("github.com", "authorization", "Basic ", secret_uri(gh["secret"], gh["basic_key"])),
+        inject("api.github.com", "authorization", "Bearer ", secret_uri(gh["secret"], gh["token_key"])),
+        inject("uploads.github.com", "authorization", "Bearer ", secret_uri(gh["secret"], gh["token_key"])),
+        {"https": {"hostnames": GITHUB_OPEN_HOSTS}},
+    ]
+    env = [{"name": "AX_ORBI_CONFIG", "value": json.dumps(agent_config(cfg), sort_keys=True)},
+           {"name": "GH_TOKEN", "value": "placeholder"}]
+    model = cfg.get("model")
+    if model:
+        mc = creds["model"]
+        egress.append(inject(urlparse(model["base_url"]).hostname, mc["header"], mc["prefix"],
+                             secret_uri(mc["secret"], mc["key"])))
+        env.append({"name": "PI_API_KEY", "value": "placeholder"})
+    extra = [h for h in cfg["network"]["allow"]]
+    if extra:
+        egress.append({"https": {"hostnames": extra}})
+
+    profile = {"image": cfg["image"]["ref"],
+               "resources": {"limits": {"cpu": str(cfg["resources"]["cpu"]),
+                                        "memory": str(cfg["resources"]["memory"])}}}
+    meta = lambda name: {"name": name, "atespace": atespace,  # noqa: E731
+                         "labels": {"app": "ax-orbi", "ax-orbi/deployment": cfg["name"]}}
+    gateway = {"apiVersion": "ax.io/v1alpha1", "kind": "Gateway", "metadata": meta(n["gateway"]),
+               "spec": {"egress": egress}}
+    workspace = {"apiVersion": "ax.io/v1alpha1", "kind": "Workspace", "metadata": meta(n["workspace"]),
+                 "spec": {"profile": profile, "setup": {
+                     "gateway": {"name": n["gateway"]},
+                     "git": [{"name": "origin",
+                              "repo": f"https://github.com/{cfg['repository']['source']}.git",
+                              "ref": cfg["repository"]["base_branch"], "dir": "repo"}]}}}
+    task = {"apiVersion": "ax.io/v1alpha1", "kind": "Task", "metadata": meta(n["task"]),
+            "spec": {"commands": ["/usr/local/bin/ax-orbi-agent", "serve"], "env": env,
+                     "workspace": {"name": n["workspace"]}, "gateway": {"name": n["gateway"]},
+                     # `ax ssh` is how the host reaches the agent. It also lets
+                     # anyone with access to this AX atespace run commands in
+                     # the sandbox.
+                     "debug": True}}
+    return [gateway, workspace, task]
+
+
+def to_yaml(value, indent: int = 0) -> str:
+    """Block YAML for the plain dict/list/scalar trees built above."""
+    pad = "  " * indent
+    if isinstance(value, dict):
+        out = []
+        for key, item in value.items():
+            if isinstance(item, (dict, list)) and item:
+                out.append(f"{pad}{key}:\n{to_yaml(item, indent + 1)}")
+            else:
+                out.append(f"{pad}{key}: {scalar(item)}")
+        return "\n".join(out)
+    out = []
+    for item in value:
+        if isinstance(item, (dict, list)) and item:
+            body = to_yaml(item, indent + 1)
+            out.append(f"{pad}- {body.lstrip()}")
+        else:
+            out.append(f"{pad}- {scalar(item)}")
+    return "\n".join(out)
+
+
+def scalar(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if value in ({}, []):
+        return "{}" if value == {} else "[]"
+    return json.dumps(value)  # a JSON string is a valid double-quoted YAML string
+
+
+def render(cfg: dict) -> str:
+    return "\n---\n".join(to_yaml(doc) for doc in manifests(cfg)) + "\n"
+
+
+# ---- running ax ------------------------------------------------------------
+
+class Ax:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.base = [cfg["ax"]["bin"], "-a", cfg["ax"]["atespace"]]
+        if cfg["ax"].get("context"):
+            self.base += ["--context", cfg["ax"]["context"]]
+
+    def run(self, *args: str, stdin: str | None = None, timeout: int = 900):
+        try:
+            proc = subprocess.run(self.base + list(args), input=stdin, text=True,
+                                  capture_output=True, timeout=timeout)
+        except FileNotFoundError:
+            return 127, "", f"{self.base[0]}: not found on PATH"
+        except subprocess.TimeoutExpired:
+            return 124, "", f"ax {' '.join(args)}: timed out after {timeout}s"
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def task_state(self, task: str) -> str:
+        """`Working`, `Suspended`, ... or `NotFound` / `Unknown`."""
+        code, out, err = self.run("get", "tasks", timeout=60)
+        if code != 0:
+            return "Unknown"
+        for line in out.splitlines()[1:]:
+            cols = line.split()
+            if len(cols) >= 3 and cols[0] == task:
+                return cols[2]
+        return "NotFound"
+
+    def agent(self, task: str, *args: str, timeout: int = 120) -> tuple[dict | None, str]:
+        """Run ax-orbi-agent in the sandbox; return (parsed JSON, error)."""
+        code, out, err = self.run("ssh", task, "--", "/usr/local/bin/ax-orbi-agent", *args,
+                                  timeout=timeout)
+        for line in reversed(out.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line), ""
+                except ValueError:
+                    break
+        return None, (err.strip() or out.strip() or f"ax ssh exited {code}")
+
+
+# ---- output ----------------------------------------------------------------
+
+class Report:
+    def __init__(self, as_json: bool):
+        self.as_json = as_json
+        self.data: dict = {"checks": []}
+
+    def check(self, name: str, ok: bool | None, detail: str, fix: str = "") -> bool:
+        """ok=None is a warning: reported, never fatal."""
+        entry = {"name": name, "ok": ok, "detail": detail}
+        if fix and ok is not True:
+            entry["fix"] = fix
+        self.data["checks"].append(entry)
+        if not self.as_json:
+            mark = {True: "ok  ", False: "FAIL", None: "warn"}[ok]
+            print(f"[{mark}] {name}: {detail}")
+            if fix and ok is not True:
+                print(f"       fix: {fix}")
+        return ok is not False
+
+    def say(self, text: str) -> None:
+        if not self.as_json:
+            print(text)
+
+    @property
+    def ok(self) -> bool:
+        return all(c["ok"] is not False for c in self.data["checks"])
+
+    def finish(self, code: int, **extra) -> int:
+        self.data.update(extra)
+        self.data["exitCode"] = code
+        if self.as_json:
+            print(json.dumps(self.data, sort_keys=True))
+        return code
+
+
+# ---- commands --------------------------------------------------------------
+
+def host_checks(report: Report, cfg: dict | None, versions: dict, cluster: bool) -> None:
+    report.check("python", sys.version_info >= (3, 11), sys.version.split()[0],
+                 "ax-orbi needs Python 3.11 or later")
+    ax_bin = (cfg or {}).get("ax", {}).get("bin", "ax")
+    found = shutil.which(ax_bin)
+    report.check("ax", bool(found), found or f"{ax_bin} not found on PATH",
+                 f"build the ax CLI from {versions['ax']['repo']} at {versions['ax']['ref'][:12]} "
+                 "(docs/SETUP.md) and add it to PATH")
+    if found:
+        try:
+            out = subprocess.run([ax_bin, "version"], capture_output=True, text=True, timeout=30)
+            text = (out.stdout + out.stderr).strip()
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            text = str(exc)
+        pinned = versions["ax"]["ref"]
+        matches = pinned in text or pinned[:7] in text
+        report.check("ax-version", True if matches else None, text.splitlines()[0] if text else "?",
+                     f"tested with google/ax {pinned[:12]}; the CLI, ax-server and the runner in the "
+                     "image must come from the same commit")
+    if cfg is None:
+        return
+    report.check("image-pinned", True, cfg["image"]["ref"])
+    if not cluster or not found:
+        return
+    ax = Ax(cfg)
+    code, out, err = ax.run("get", "tasks", timeout=60)
+    report.check("ax-cluster", code == 0,
+                 "control plane reachable" if code == 0 else (err or out).strip().splitlines()[-1:][0]
+                 if (err or out).strip() else f"ax get tasks exited {code}",
+                 "start it with `ax local start` or select a cluster with `ax ctx`; "
+                 "`ax local status` shows which layer is down")
+    kubectl = shutil.which("kubectl") or shutil.which(str(Path.home() / ".ax/bin/kubectl"))
+    secrets = [("github", cfg["credentials"]["github"]["secret"])]
+    if cfg.get("model"):
+        secrets.append(("model", cfg["credentials"]["model"]["secret"]))
+    for label, secret in secrets:
+        namespace, name = secret.split("/")
+        if not kubectl:
+            report.check(f"secret:{label}", None, f"{secret} not verified (kubectl not found)")
+            continue
+        cmd = [kubectl, "-n", namespace, "get", "secret", name,
+               "-o", "jsonpath={.metadata.labels.ax\\.io/credential}"]
+        if cfg["ax"].get("context"):
+            cmd[1:1] = ["--context", cfg["ax"]["context"]]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            report.check(f"secret:{label}", False, f"{secret} not found",
+                         "create it as docs/SETUP.md describes; the value never goes in the config")
+        else:
+            report.check(f"secret:{label}", proc.stdout.strip() == "true" or None,
+                         f"{secret} exists" + ("" if proc.stdout.strip() == "true"
+                                                else " but lacks the label ax.io/credential=true"),
+                         f"kubectl -n {namespace} label secret {name} ax.io/credential=true")
+
+
+def cmd_check(args, report: Report) -> int:
+    versions = load_versions()
+    cfg = None
+    try:
+        cfg = load_config(args.config)
+        report.check("config", True, f"{args.config}: deployment {cfg['name']} for "
+                                     f"{cfg['repository']['source']}")
+    except ConfigError as exc:
+        report.check("config", False, str(exc))
+    host_checks(report, cfg, versions, cluster=not args.offline)
+    report.say("ready" if report.ok else "not ready: fix the FAIL lines above")
+    return report.finish(EXIT_OK if report.ok else EXIT_FAILED)
+
+
+def build_args(versions: dict) -> dict:
+    return {
+        "GOLANG_IMAGE": versions["base_images"]["golang"],
+        "NODE_IMAGE": versions["base_images"]["node"],
+        "PYTHON_IMAGE": versions["base_images"]["python"],
+        "AX_REPO": versions["ax"]["repo"], "AX_REF": versions["ax"]["ref"],
+        "ORBI_REPO": versions["orbi"]["repo"], "ORBI_TAG": versions["orbi"]["tag"],
+        "ORBI_COMMIT": versions["orbi"]["commit"],
+        "PI_PACKAGE": versions["pi"]["package"], "PI_VERSION": versions["pi"]["version"],
+        "GH_VERSION": versions["gh"]["version"],
+        "GH_SHA256_AMD64": versions["gh"]["sha256_amd64"],
+        "GH_SHA256_ARM64": versions["gh"]["sha256_arm64"],
+    }
+
+
+def pins_id(versions: dict) -> str:
+    blob = json.dumps(build_args(versions), sort_keys=True).encode()
+    agent = (ROOT / "image" / "ax-orbi-agent").read_bytes()
+    return hashlib.sha256(blob + agent).hexdigest()[:12]
+
+
+def cmd_build(args, report: Report) -> int:
+    versions = load_versions()
+    engine = args.engine or shutil.which("docker") and "docker" or shutil.which("podman") and "podman"
+    if not engine:
+        report.check("container-engine", False, "neither docker nor podman found")
+        return report.finish(EXIT_FAILED)
+    tag = f"{args.repository}:{pins_id(versions)}"
+    cmd = [engine, "build", "-f", str(ROOT / "image" / "Dockerfile"), "-t", tag]
+    for key, value in build_args(versions).items():
+        cmd += ["--build-arg", f"{key}={value}"]
+    cmd.append(str(ROOT / "image"))
+    report.say(f"building {tag}")
+    out = sys.stderr if report.as_json else None
+    if subprocess.run(cmd, stdout=out).returncode != 0:
+        report.check("build", False, "image build failed; the error is above")
+        return report.finish(EXIT_FAILED)
+    report.check("build", True, tag)
+    ref = None
+    if args.push:
+        push = [engine, "push", tag]
+        if engine == "podman" and re.match(r"^(localhost|127\.0\.0\.1)(:\d+)?/", tag):
+            push.insert(2, "--tls-verify=false")
+        if subprocess.run(push, stdout=out).returncode != 0:
+            report.check("push", False, f"could not push {tag}",
+                         "check the registry address and that you are logged in to it")
+            return report.finish(EXIT_FAILED)
+        proc = subprocess.run([engine, "image", "inspect", "--format", "{{json .RepoDigests}}", tag],
+                              capture_output=True, text=True)
+        digests = json.loads(proc.stdout or "[]") if proc.returncode == 0 else []
+        ref = next((d for d in digests if d.startswith(args.repository + "@")), None)
+        if not report.check("push", bool(ref), ref or "pushed, but no digest was reported",
+                            f"resolve it with `{engine} buildx imagetools inspect {tag}`"):
+            return report.finish(EXIT_FAILED, tag=tag)
+        report.say(f'\nset this in your deployment config:\n\n[image]\nref = "{ref}"')
+    return report.finish(EXIT_OK, tag=tag, ref=ref)
+
+
+def cmd_render(args, report: Report) -> int:
+    cfg = load_config(args.config)
+    if report.as_json:
+        return report.finish(EXIT_OK, manifests=manifests(cfg))
+    sys.stdout.write(render(cfg))
+    return EXIT_OK
+
+
+def wait_for_agent(ax: Ax, task: str, timeout: int, want_prepared: bool = True):
+    """Poll the agent until its supervisor is alive (and has finished prepare)."""
+    deadline = time.monotonic() + timeout
+    status, err = None, "no answer yet"
+    while time.monotonic() < deadline:
+        status, err = ax.agent(task, "status", "--json")
+        if status and status.get("supervisorAlive") and (status.get("prepare") or not want_prepared):
+            return status, ""
+        time.sleep(3)
+    return status, err or "the agent's supervisor did not come up in time"
+
+
+def ensure_working(ax: Ax, task: str, report: Report) -> bool:
+    state = ax.task_state(task)
+    if state == "NotFound":
+        return report.check("task", False, f"task {task} does not exist",
+                            "create it with `ax-orbi prepare`")
+    if state in ("Working", "Running"):
+        return report.check("task", True, f"{task} is {state}")
+    code, out, err = ax.run("resume", "task", task)
+    return report.check("task", code == 0,
+                        f"{task} resumed (was {state})" if code == 0 else (err or out).strip(),
+                        f"`ax describe task {task}` shows the failing condition")
+
+
+def report_prepare(report: Report, status: dict | None, err: str) -> bool:
+    if not status:
+        return report.check("agent", False, f"no answer from the agent: {err}",
+                            "the sandbox may still be starting; `ax-orbi inspect` retries. "
+                            "If it persists, check `ax describe task`")
+    report.check("agent", bool(status.get("supervisorAlive")),
+                 "supervisor alive" if status.get("supervisorAlive") else "supervisor is not running",
+                 "recover with `ax-orbi stop` then `ax-orbi recover`")
+    prep = status.get("prepare") or {}
+    for item in prep.get("checks", []):
+        report.check(f"sandbox:{item['name']}", item["ok"], item["detail"], item.get("fix", ""))
+    return bool(prep.get("ok")) and bool(status.get("supervisorAlive"))
+
+
+def cmd_prepare(args, report: Report) -> int:
+    cfg = load_config(args.config)
+    host_checks(report, cfg, load_versions(), cluster=True)
+    if not report.ok:
+        return report.finish(EXIT_FAILED)
+    ax, n = Ax(cfg), names(cfg)
+    code, out, err = ax.run("apply", "-f", "-", stdin=render(cfg))
+    detail = (out + err).strip()
+    fix = ""
+    if "FailedPrecondition" in detail or "immutable" in detail.lower():
+        fix = ("Workspaces and Tasks are immutable. To change image, repository, limits or network, "
+               f"use a new `name` in the config, or delete this deployment first: ax-orbi stop --delete")
+    if not report.check("apply", code == 0, detail.replace("\n", "; ") or "applied", fix):
+        return report.finish(EXIT_FAILED)
+    if not ensure_working(ax, n["task"], report):
+        return report.finish(EXIT_FAILED)
+    status, err = wait_for_agent(ax, n["task"], args.timeout)
+    ready = report_prepare(report, status, err)
+    report.say("prepared; no delivery was started. Run a tick with `ax-orbi run`."
+               if ready else "the sandbox is up but not ready for a tick; fix the FAIL lines above")
+    return report.finish(EXIT_OK if ready and report.ok else EXIT_FAILED, task=n["task"])
+
+
+def describe_run(report: Report, run: dict) -> None:
+    report.say(f"run {run.get('id')}: {run.get('status')}"
+               + (f" (exit {run['exitCode']})" if "exitCode" in run else ""))
+    if run.get("detail"):
+        report.say(f"  {run['detail']}")
+    if run.get("log"):
+        report.say(f"  log: {run['log']} (in the sandbox; `ax-orbi inspect --run {run.get('id')} --logs`)")
+
+
+def run_exit(run: dict | None) -> int:
+    status = (run or {}).get("status")
+    if status == "succeeded":
+        return EXIT_OK
+    if status == "failed":
+        return EXIT_FAILED
+    return EXIT_INTERRUPTED
+
+
+def cmd_run(args, report: Report) -> int:
+    cfg = load_config(args.config)
+    ax, n = Ax(cfg), names(cfg)
+    if not ensure_working(ax, n["task"], report):
+        return report.finish(EXIT_FAILED)
+    status, err = wait_for_agent(ax, n["task"], args.start_timeout)
+    if not report_prepare(report, status, err):
+        report.say("not running a tick: the sandbox is not ready")
+        return report.finish(EXIT_FAILED)
+    request = ["request-tick"] + (["--id", args.id] if args.id else [])
+    answer, err = ax.agent(n["task"], *request)
+    if not answer:
+        report.check("request", False, f"could not request a tick: {err}")
+        return report.finish(EXIT_INTERRUPTED)
+    run_id = answer["id"]
+    report.check("request", True, f"tick {run_id}" + (" (already requested; not started again)"
+                                                      if answer.get("duplicate") else " requested"))
+    run = answer.get("run") or {}
+    deadline = time.monotonic() + args.timeout if args.timeout else None
+    misses = 0
+    while run.get("status") not in ("succeeded", "failed", "interrupted"):
+        if args.no_wait:
+            break
+        if deadline and time.monotonic() > deadline:
+            report.say(f"still running after {args.timeout}s; the tick continues in the sandbox. "
+                       f"Check later with: ax-orbi inspect --run {run_id}")
+            return report.finish(EXIT_INTERRUPTED, run=run)
+        time.sleep(args.poll)
+        status, err = ax.agent(n["task"], "status", "--json", "--run", run_id)
+        if not status or not status.get("runs"):
+            misses += 1
+            if misses >= 10:
+                report.check("poll", False, f"lost contact with the sandbox: {err}",
+                             f"the outcome is unknown, not failed. Check: ax-orbi inspect --run {run_id}")
+                return report.finish(EXIT_INTERRUPTED, run=run)
+            continue
+        misses = 0
+        run = status["runs"][0]
+    describe_run(report, run)
+    return report.finish(run_exit(run) if not args.no_wait else EXIT_OK, run=run)
+
+
+def cmd_inspect(args, report: Report) -> int:
+    cfg = load_config(args.config)
+    ax, n = Ax(cfg), names(cfg)
+    state = ax.task_state(n["task"])
+    report.data["taskState"] = state
+    if state == "NotFound":
+        report.check("task", False, f"task {n['task']} does not exist", "create it with `ax-orbi prepare`")
+        return report.finish(EXIT_FAILED)
+    if state == "Unknown":
+        report.check("task", False, "cannot reach the AX control plane",
+                     "`ax local status` or `ax ctx` shows what is down")
+        return report.finish(EXIT_FAILED)
+    if state not in ("Working", "Running"):
+        report.check("task", None, f"{n['task']} is {state}: the sandbox is checkpointed, "
+                                   "its state is kept, and nothing is running",
+                     "bring it back with `ax-orbi recover`")
+        return report.finish(EXIT_OK)
+    report.check("task", True, f"{n['task']} is {state}")
+    extra = ["--run", args.run] if args.run else ["--limit", str(args.limit)]
+    status, err = ax.agent(n["task"], "status", "--json", *extra)
+    ready = report_prepare(report, status, err)
+    runs = (status or {}).get("runs", [])
+    if status and status.get("error"):
+        report.check("run", False, status["error"])
+    health = (status or {}).get("health") or {}
+    report.say(f"supervisor state: {health.get('state', '?')}"
+               + (f", running {health['currentRun']}" if health.get("currentRun") else "")
+               + f"; runs: {json.dumps((status or {}).get('counts', {}), sort_keys=True)}")
+    for run in runs:
+        describe_run(report, run)
+    logs = None
+    if args.logs and (args.run or runs):
+        run_id = args.run or runs[-1]["id"]
+        code, out, err = ax.run("ssh", n["task"], "--", "/usr/local/bin/ax-orbi-agent",
+                                "logs", "--run", run_id, "--tail", str(args.tail))
+        logs = out
+        report.say(f"--- last {args.tail} log lines of {run_id} ---\n{out.rstrip()}")
+    return report.finish(EXIT_OK if ready and report.ok else EXIT_FAILED, status=status, logs=logs)
+
+
+def cmd_stop(args, report: Report) -> int:
+    cfg = load_config(args.config)
+    ax, n = Ax(cfg), names(cfg)
+    state = ax.task_state(n["task"])
+    if state == "NotFound" and not args.delete:
+        report.check("task", None, f"task {n['task']} does not exist; nothing to stop")
+        return report.finish(EXIT_OK)
+    running = None
+    if state == "Unknown":
+        report.check("task", False, "cannot reach the AX control plane",
+                     "`ax local status` or `ax ctx` shows what is down")
+        return report.finish(EXIT_FAILED)
+    if state in ("Working", "Running"):
+        status, _ = ax.agent(n["task"], "status", "--json")
+        running = ((status or {}).get("health") or {}).get("currentRun")
+        if running and not args.force:
+            report.check("stop", False, f"tick {running} is running",
+                         "wait for it (`ax-orbi inspect`), or stop anyway with --force: the tick is "
+                         "recorded as interrupted and Orbi resumes that delivery on the next tick")
+            return report.finish(EXIT_FAILED)
+        code, out, err = ax.run("suspend", "task", n["task"])
+        if not report.check("suspend", code == 0,
+                            f"{n['task']} checkpointed; /workspace is kept" if code == 0
+                            else (err or out).strip()):
+            return report.finish(EXIT_FAILED)
+    elif state != "NotFound":
+        report.check("suspend", True, f"{n['task']} is already {state}")
+    if args.delete:
+        if not args.yes_delete_state:
+            report.check("delete", False, "deleting removes the sandbox and its /workspace: "
+                         "the checkout, unpushed worktrees, Pi sessions and every run record",
+                         "repeat with --delete --yes-delete-state if that is what you want")
+            return report.finish(EXIT_USAGE)
+        for kind, name in (("task", n["task"]), ("workspace", n["workspace"]), ("gateway", n["gateway"])):
+            code, out, err = ax.run("delete", kind, name)
+            gone = code == 0 or "not found" in (out + err).lower()
+            report.check(f"delete:{kind}", gone, f"{name} deleted" if gone else (err or out).strip())
+    return report.finish(EXIT_OK if report.ok else EXIT_FAILED, interruptedRun=running)
+
+
+def cmd_recover(args, report: Report) -> int:
+    cfg = load_config(args.config)
+    ax, n = Ax(cfg), names(cfg)
+    if not ensure_working(ax, n["task"], report):
+        return report.finish(EXIT_FAILED)
+    status, err = wait_for_agent(ax, n["task"], args.timeout)
+    ready = report_prepare(report, status, err)
+    runs = (status or {}).get("runs", [])
+    interrupted = [r for r in runs if r.get("status") == "interrupted"]
+    queued = [r for r in runs if r.get("status") in ("queued", "running")]
+    for run in interrupted:
+        describe_run(report, run)
+    if interrupted:
+        report.say("interrupted ticks are kept as evidence and are not re-run. Orbi tracks each "
+                   "delivery in GitHub labels, so `ax-orbi run` picks the work up where it stopped.")
+    for run in queued:
+        report.say(f"run {run['id']} was requested before the stop and never started; it runs now.")
+    if ready and not interrupted and not queued:
+        report.say("recovered; nothing was interrupted.")
+    return report.finish(EXIT_OK if ready and report.ok else EXIT_FAILED,
+                         interrupted=[r["id"] for r in interrupted])
+
+
+def main(argv: list[str] | None = None) -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-c", "--config", type=Path, default=Path("ax-orbi.toml"),
+                        help="deployment config (default: ./ax-orbi.toml)")
+    common.add_argument("--json", action="store_true", help="print one JSON object")
+    parser = argparse.ArgumentParser(prog="ax-orbi", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("check", parents=[common], help="prerequisites, pins and config")
+    p.add_argument("--offline", action="store_true", help="skip the checks that need the cluster")
+    p = sub.add_parser("build", parents=[common], help="build the task image from versions.toml")
+    p.add_argument("--repository", default="localhost:5001/ax-orbi",
+                   help="image repository (default: localhost:5001/ax-orbi, the AX local registry)")
+    p.add_argument("--push", action="store_true", help="push and print the digest reference")
+    p.add_argument("--engine", choices=["docker", "podman"])
+    sub.add_parser("render", parents=[common], help="print the AX manifests")
+    p = sub.add_parser("prepare", parents=[common], help="create and start the sandbox; no delivery")
+    p.add_argument("--timeout", type=int, default=300, help="seconds to wait for the agent")
+    p = sub.add_parser("run", parents=[common], help="run one Orbi tick")
+    p.add_argument("--id", help="run id; repeating one never starts a second execution")
+    p.add_argument("--timeout", type=int, default=0, help="stop waiting after N seconds (0: wait)")
+    p.add_argument("--start-timeout", type=int, default=300)
+    p.add_argument("--poll", type=int, default=10, help="seconds between status checks")
+    p.add_argument("--no-wait", action="store_true", help="request the tick and return")
+    p = sub.add_parser("inspect", parents=[common], help="health, runs and evidence")
+    p.add_argument("--run", help="show one run")
+    p.add_argument("--limit", type=int, default=5)
+    p.add_argument("--logs", action="store_true", help="print the end of the run's log")
+    p.add_argument("--tail", type=int, default=100)
+    p = sub.add_parser("stop", parents=[common], help="checkpoint the sandbox; state is kept")
+    p.add_argument("--force", action="store_true", help="stop even while a tick is running")
+    p.add_argument("--delete", action="store_true", help="also delete the sandbox and its state")
+    p.add_argument("--yes-delete-state", action="store_true")
+    p = sub.add_parser("recover", parents=[common], help="resume and report interrupted runs")
+    p.add_argument("--timeout", type=int, default=300)
+
+    args = parser.parse_args(argv)
+    report = Report(args.json)
+    handler = {"check": cmd_check, "build": cmd_build, "render": cmd_render, "prepare": cmd_prepare,
+               "run": cmd_run, "inspect": cmd_inspect, "stop": cmd_stop, "recover": cmd_recover}
+    try:
+        return handler[args.command](args, report)
+    except ConfigError as exc:
+        report.check("config", False, str(exc))
+        return report.finish(EXIT_USAGE)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
