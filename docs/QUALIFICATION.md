@@ -33,13 +33,16 @@ including logs, before sharing. Don't record environment dumps, Secret contents
 or HTTP authorization headers.
 
 Use Bash from the ax-orbi checkout. The procedures use `./ax-orbi.toml` unless
-a different file is specified. For direct AX commands, set `CONTEXT` and
-`ATESPACE` to the same values used by ax-orbi (the selected context if not set
-in TOML), and set `TASK` to `orbi-` plus the config's `name`. Use the configured
-AX binary if it isn't `ax`. Set `REPO` to the disposable `OWNER/REPO`.
+a different file is specified. For direct AX commands, set `CONTEXT` to
+`ax.context` (or the active context if unset) and `ATESPACE` to `ax.atespace`
+(default `default`). Set `AX_BIN` if `ax.bin` isn't `ax`. Set `TASK` to `orbi-`
+plus the config's `name` and `REPO` to the disposable `OWNER/REPO`. Set these
+in each terminal that runs commands. For Q-B through Q-F, use a host `gh`
+login authorized to manage Issues and read PRs in the fixture; keep that
+login on the host, not in the AX sandbox.
 
 ```bash
-AX=(ax --context "$CONTEXT" -a "$ATESPACE")
+AX=("${AX_BIN:-ax}" --context "$CONTEXT" -a "$ATESPACE")
 TIMEFORMAT='wall=%3R s'
 ```
 
@@ -63,6 +66,10 @@ check `detail`/`fix` text, not just your interpretation. See [Interpreting resul
 
 ## Scenario records
 
+Take the Q-G samples during Q-D as indicated, before moving on to Q-E and the
+Docker baseline. Keep the target config and all evidence for each scenario
+separate.
+
 ### Q-A — Clean setup on a second machine
 
 **Result:** NOT RUN
@@ -77,15 +84,15 @@ operator gets only the [README](../README.md) and setup guide as instructions.
    the final commands and codes (including the version banner):
 
    ```bash
-   timeout 30s ax version
+   timeout 30s "${AX[@]}" version
    time timeout 180s bin/ax-orbi check --json
    time timeout 1800s bin/ax-orbi prepare --json
    printf 'prepare exit=%s\n' "$?"
    ```
 
-2. In a second terminal, the observer starts sampling `timeout 10s "${AX[@]}" get tasks`
-   as `prepare` starts its internal `ax apply`, then samples again until
-   `prepare` returns (at most once per second for the prepare time budget).
+2. In a second terminal, the observer starts sampling
+   `timeout 20s "${AX[@]}" get tasks` just before `prepare`, then repeats with
+   a one-second pause until `prepare` returns or its 1800-second budget expires.
    Record the timestamped states actually seen, including the first one after
    apply; don't apply again just to sample a missed state. Note every guide
    deviation, where it was needed, and what unblocked the operator. For
@@ -107,11 +114,13 @@ and checks: —; deviations and repairs: —.
 
 **Result:** NOT RUN
 
-**Prerequisites.** Prepared, `Working` task with a live, idle supervisor and
-passing `image-pins`. Use an HTTPS-clonable public disposable repository with
-no sensitive contents (so Docker can clone the same fixture unauthenticated).
-Enable Issues and PRs. The model and GitHub write access must come from the
-configured Gateway. No other Issue is eligible.
+**Prerequisites.** Freshly prepared `Working` task with a live, idle supervisor
+and passing `image-pins`. Use an HTTPS-clonable public disposable repository
+with no sensitive contents (so Docker can clone it unauthenticated). Enable
+Issues and PRs and use the repository's default branch as
+`repository.base_branch`. The model and GitHub write access must come from
+the configured Gateway; do not log in from inside the sandbox. No other
+Issue is eligible.
 
 1. Read the pinned label registry with the first command below, then create
    those labels in GitHub's label editor without starting a scheduler.
@@ -120,38 +129,46 @@ configured Gateway. No other Issue is eligible.
    timeout 30s "${AX[@]}" ssh "$TASK" -- cat /opt/orbi/src/orbi/labels.toml
    ```
 
-   Create one bounded Issue and keep the printed URL as `ISSUE_URL`. Capture
-   GitHub before requesting the tick; repeat the snapshot after each delivery
-   or interruption trial.
+   Create one bounded Issue. Use this command again with a new `FIXTURE`
+   letter (`b` for Q-C, `c` and `d` for Q-F). Capture GitHub before requesting
+   each tick and after each delivery or interruption trial. If Issue creation
+   times out, check GitHub before trying again.
 
    ```bash
-   timeout 60s gh issue create --repo "$REPO" --label ai-ready \
-     --title 'Add qualification-a.txt' \
-     --body 'Add qualification-a.txt containing exactly one line: qualification A. Leave other files unchanged.'
+   FIXTURE=a
+   ISSUE_URL=$(timeout 60s gh issue create --repo "$REPO" --label ai-ready \
+     --title "Add qualification-$FIXTURE.txt" \
+     --body "Add qualification-$FIXTURE.txt containing exactly one line: qualification $FIXTURE. Leave other files unchanged.")
+   printf 'issue create exit=%s; url=%s\n' "$?" "$ISSUE_URL"
    github_snapshot() {
      timeout 60s gh issue view "$ISSUE_URL" --repo "$REPO" --json url,state,labels,comments &&
-     timeout 60s gh pr list --repo "$REPO" --state all --json url,state,headRefName,closingIssuesReferences,comments &&
-     timeout 60s git ls-remote --heads "https://github.com/$REPO.git"
+     timeout 60s gh pr list --repo "$REPO" --state all --json url,state,headRefName,body,closingIssuesReferences,comments &&
+     GIT_TERMINAL_PROMPT=0 timeout 60s git ls-remote --heads "https://github.com/$REPO.git"
    }
    github_snapshot
    ```
 
-2. Check the actual supervisor environment without printing its values. In
-   the rendered Task, verify credential environment entries are placeholders;
-   in the rendered Gateway, verify only Secret references are configured. The
-   probe also checks the generated Pi config uses an environment reference.
-   Check the tick logs for exposure after step 3; do not publish raw secret
-   values or copy a real secret into the sandbox to check for it.
+2. With fresh inspect confirming the supervisor is alive, compare the
+   rendered Task and Gateway with the applied resources. In the Task the
+   credential environment entries must be placeholders; in the Gateway the
+   injection rules must use Secret references. The probe validates the actual
+   supervisor environment and generated Pi config without printing values.
+   Review applied specs and the tick log privately for exposure before
+   sharing evidence; do not copy a real secret into the sandbox to check for it.
 
    ```bash
+   timeout 180s bin/ax-orbi inspect --json
    timeout 30s bin/ax-orbi render --json
+   timeout 60s "${AX[@]}" get task "$TASK"
+   timeout 60s "${AX[@]}" get gateway "${TASK}-gw"
    timeout 30s "${AX[@]}" ssh "$TASK" -- python3 -c '
    import json
    from pathlib import Path
    state = Path("/workspace/.ax-orbi")
    pid = json.loads((state / "health.json").read_text())["pid"]
    env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-   placeholders = all(k + b"=placeholder" in env for k in (b"GH_TOKEN", b"PI_API_KEY"))
+   placeholders = all([v for v in env if v.startswith(k + b"=")] == [k + b"=placeholder"]
+                      for k in (b"GH_TOKEN", b"PI_API_KEY"))
    providers = json.loads((state / "pi-providers.json").read_text())["providers"]
    references = bool(providers) and all(p.get("apiKey") == "$PI_API_KEY" for p in providers.values())
    print("supervisor placeholders:", placeholders, "Pi environment reference:", references)
@@ -162,15 +179,20 @@ configured Gateway. No other Issue is eligible.
    record and verbatim tick output (redacted, not classified or paraphrased).
    If the wait ends early, inspect that run until terminal within your
    trial budget; don't send another request. If no ID was returned, inspect
-   recent runs before taking any action. Increase `--tail` if the log is
-   truncated. Compare GitHub snapshots and save the linked PR URL and the
-   provider-side record of a successful call for the configured model in the
-   tick's time window (or equivalent Pi session evidence).
+   recent runs before taking any action. The agent's `--logs` view is capped
+   at the last 256 KiB before line selection. If truncated, read the log file
+   directly into a private record before sharing a redacted copy. Compare
+   GitHub snapshots and save the linked PR URL and a provider-side record
+   of a successful call for the configured model in the tick's time window
+   (or equivalent Pi session evidence).
 
    ```bash
    time timeout 1500s bin/ax-orbi run --json --timeout 900
    printf 'run exit=%s\n' "$?"
+   # After setting RUN_ID from the returned run record:
    timeout 180s bin/ax-orbi inspect --json --run "$RUN_ID" --logs --tail 1000
+   # If the log view is truncated, in a private terminal or recording:
+   timeout 60s "${AX[@]}" ssh "$TASK" -- cat "/workspace/.ax-orbi/runs/$RUN_ID/tick.log"
    github_snapshot
    ```
 
@@ -193,49 +215,66 @@ surfaces and observations (no values): —.
 **Prerequisites.** Finish Q-B; its tick and delivery must be terminal so they
 cannot take precedence over the fresh Issue. Any follow-up needed to finish
 Q-B is outside its measured tick. Use two terminals and get permission to
-force-stop this disposable task. Create a fresh Issue of similar size with a
-different filename and set `ISSUE_URL` to its URL. Have an observer capture
-GitHub evidence while the tick is active.
+force-stop this disposable task. Use Q-B step 1 with `FIXTURE=b`. Have an
+observer capture GitHub evidence while the tick is active.
 
 1. Write a marker outside the checkout, snapshot GitHub, and request one
-   tick. Set `OLD_RUN_ID` from `run.id`. Poll inspect for `running`, the same
-   `status.health.currentRun`, and evidence that Orbi claimed this Issue (e.g.
-   Issue label/comment and delivery run ID). Save the run and GitHub snapshots
-   just before the stop, including any branch or PR already created.
+   tick. Set `OLD_RUN_ID` from `run.id`. Within the tick budget, poll inspect
+   for `running`, `status.supervisorAlive: true`, and the same
+   `status.health.currentRun`. Have the observer monitor the Issue in parallel
+   for a claim label/comment and delivery run ID. Save the pre-stop run and
+   GitHub snapshots, including any branch or PR already created. The full
+   GitHub snapshot can finish while the stop is in progress; timestamp it so
+   effects aren't misattributed. If there is observable work in the delivery
+   worktree before stop, note the worktree and changes and check their
+   preservation after recover, before requesting a new tick. The marker alone
+   shows the volume persisted, not that delivery state survived.
 
    ```bash
    timeout 30s "${AX[@]}" ssh "$TASK" -- sh -c 'printf "%s\n" qualification > /workspace/.qualification-marker'
    github_snapshot
-   timeout 450s bin/ax-orbi run --json --no-wait
+   time timeout 450s bin/ax-orbi run --json --no-wait
+   # After setting OLD_RUN_ID:
    timeout 180s bin/ax-orbi inspect --json --run "$OLD_RUN_ID" --logs
    ```
 
 2. While that tick is still running, force-stop from the second terminal.
    Save `interruptedRun` and `executionUnknown` if present. Confirm AX reports
-   `Suspended` without using SSH before attempting recovery. After recovery,
-   inspect the old run and read the marker before submitting any new work.
+   `Suspended` without using SSH before attempting recovery.
 
    ```bash
    time timeout 600s bin/ax-orbi stop --json --force
    printf 'stop exit=%s\n' "$?"
    timeout 60s "${AX[@]}" get tasks
+   ```
+
+   Once checkpointed, recover, inspect the old run and read the marker before
+   submitting any new work. Check that the old ID is in `interrupted`, the old
+   record still has its original `startedAt` and `bootId`, and the new
+   supervisor has no queued or running work. If the stop didn't report the old
+   ID, use the preserved record to determine whether the tick was interrupted
+   or completed before the stop; don't infer interruption from exit 0.
+
+   ```bash
    time timeout 900s bin/ax-orbi recover --json
    printf 'recover exit=%s\n' "$?"
-   timeout 180s bin/ax-orbi inspect --json --run "$OLD_RUN_ID" --logs
+   timeout 180s bin/ax-orbi inspect --json --run "$OLD_RUN_ID" --logs --tail 1000
    timeout 30s "${AX[@]}" ssh "$TASK" -- cat /workspace/.qualification-marker
    github_snapshot
    ```
 
-3. Only after verifying recovery, request one **new** tick and set
-   `NEW_RUN_ID` from `run.id`. Compare the
-   two records, counts, `startedAt`, `bootId`, and logs to the recovery
-   snapshot. Compare Issue and PR comments (IDs, stages and run markers) and
-   branch/PR history on GitHub, including closed or merged PRs. Record whether
-   Orbi resumed/continued the existing delivery, or what it actually did
-   instead and why. Don't re-label the Issue or intervene to make it continue.
+3. Only after verifying recovery of the interrupted tick, request one **new**
+   tick and set `NEW_RUN_ID` from `run.id`. Verify the old record, including
+   its timestamps and boot ID, and its log are unchanged since recovery, and
+   that the counts reflect only the new request. Compare Issue and PR comments
+   (IDs, stages and run markers) and branch/PR history on GitHub, including
+   closed or merged PRs. Record whether Orbi resumed the existing delivery, or
+   what it actually did instead and why. Don't re-label the Issue or intervene
+   to make it continue.
 
    ```bash
    time timeout 1500s bin/ax-orbi run --json --timeout 900
+   # After setting NEW_RUN_ID:
    timeout 180s bin/ax-orbi inspect --json --run "$NEW_RUN_ID" --logs --tail 1000
    timeout 180s bin/ax-orbi inspect --json --run "$OLD_RUN_ID" --logs --tail 1000
    timeout 180s bin/ax-orbi inspect --json
@@ -316,8 +355,7 @@ settings unchanged. Confirm each observed state, not just the injection exit.
    # Terminal 2
    for ((n=0; n<40; n++)); do
      date -u +%FT%TZ
-     timeout 8s "${AX[@]}" get tasks
-     timeout 8s bin/ax-orbi inspect --json
+     timeout 20s bin/ax-orbi inspect --json
      printf 'inspect exit=%s\n' "$?"
      sleep 1
    done
@@ -346,24 +384,34 @@ wall-clock times, JSON check lines and detail/fix text, and any deviation.
 
 **Result:** NOT RUN
 
-**Prerequisites.** Same pinned image on a dedicated disposable Linux host or
-VM with adequate memory headroom. Use a fresh deployment config `LIMIT_CONFIG`
-with a new `name` and `resources.memory = "512Mi"`; stop/checkpoint other trials
-before preparing it. Set `LIMIT_TASK` from its name. Set `DENIED_URL` to a
-harmless HTTPS endpoint you control that returns 2xx without authentication or
-redirects; verify its host is absent from the rendered Gateway rules. Do not
-probe arbitrary systems or send credentials with either request.
+**Prerequisites.** Same pinned image on a dedicated disposable Linux worker
+host or VM with adequate memory headroom and operator access to its resource
+and kernel evidence. Use a fresh deployment config `LIMIT_CONFIG` with a new
+`name` and `resources.memory = "512Mi"`; stop/checkpoint other trials before
+preparing it. Set `LIMIT_TASK` to `orbi-` plus that config's `name`. Set
+`DENIED_URL` to a harmless HTTPS endpoint you control that returns 2xx without
+authentication or redirects; verify its host is absent from the Gateway rules.
+Do not probe arbitrary systems or send credentials with either request.
 
-1. Render, then prepare the limited deployment. Verify the applied profile
-   and actual sandbox limit with cluster evidence before doing the memory
-   probe. In particular, verify that the Task uses the Workspace profile.
-   Capture host free memory, responsiveness and the kernel log window before
-   and after both probes (use a cluster operator for the worker's logs).
+1. Render, then prepare the limited deployment. Verify that the applied Task
+   uses the Workspace profile and that its resolved sandbox limit is 512 MiB
+   before doing the memory probe. Match the `Template` and `Actor UID` from
+   AX to the corresponding Substrate template and worker evidence. Have the
+   operator record the limit and identify the correct worker if the CLI is
+   on another host.
 
    ```bash
    timeout 30s bin/ax-orbi render --config "$LIMIT_CONFIG"
    time timeout 1800s bin/ax-orbi prepare --config "$LIMIT_CONFIG" --json
    timeout 60s "${AX[@]}" describe task "$LIMIT_TASK"
+   timeout 60s "${AX[@]}" get workspace "${LIMIT_TASK}-ws"
+   timeout 60s "${AX[@]}" get gateway "${LIMIT_TASK}-gw"
+   ```
+
+   Run the following on the **worker** before step 2 and again after step 3:
+
+   ```bash
+   date -u '+%Y-%m-%d %H:%M:%S UTC'
    free -m
    uptime
    ```
@@ -383,21 +431,34 @@ probe arbitrary systems or send credentials with either request.
 3. Run one small allocation control and then one bounded, single-process
    allocation of 576 MiB inside that sandbox. Touch each page to request real
    memory, not just virtual address space. Do not retry in a loop or increase
-   the allocation if it succeeds. Capture sandbox enforcement evidence (e.g.
-   the worker's sandbox-scoped OOM event) and check host and AX health again.
+   the allocation if it succeeds.
 
    ```bash
-   timeout 30s "${AX[@]}" ssh "$LIMIT_TASK" -- python3 -c 'print(len(bytearray(16 * 1024**2)))'
-   time timeout 45s "${AX[@]}" ssh "$LIMIT_TASK" -- timeout 20s python3 -c '
-   b = bytearray(576 * 1024**2)
+   allocate() {
+     time timeout 45s "${AX[@]}" ssh "$LIMIT_TASK" -- timeout 20s python3 -c '
+   import sys
+   b = bytearray(int(sys.argv[1]) * 1024**2)
    for i in range(0, len(b), 4096):
        b[i] = 1
-   print("allocation completed", len(b))'
-   printf 'sandbox allocation exit=%s\n' "$?"
-   free -m
-   uptime
+   print("allocation completed", len(b))' "$1"
+   }
+   allocate 16
+   printf 'small allocation exit=%s\n' "$?"
+   # Run the larger probe only if the control succeeded:
+   allocate 576
+   printf 'large allocation exit=%s\n' "$?"
    timeout 60s "${AX[@]}" get tasks
    timeout 60s "${AX[@]}" describe task "$LIMIT_TASK"
+   ```
+
+   On the worker, repeat the health readings and collect the kernel messages
+   between the two UTC timestamps (`START_UTC` and `END_UTC`). Use your
+   cluster's equivalent log source if the worker does not use journald. Look
+   for a sandbox-scoped OOM/limit event matching the actor and probe time, and
+   check for any host-wide OOM or disruption.
+
+   ```bash
+   timeout 30s journalctl --no-pager -k --since "$START_UTC" --until "$END_UTC"
    ```
 
 **Expected:** The host request and small allocation succeed, the sandbox
@@ -422,18 +483,21 @@ fixture. Use the same immutable image digest, platform and model, with
 comparable fresh Issues (one eligible at a time) and equivalent fixture
 content. Record the starting base SHAs and any differences, such as changes
 landed in an earlier trial. Don't reuse the AX Issue or its delivery state.
-Use a trusted Docker daemon, disposable credentials, and a new named
-volume. `bin/ax-orbi` cannot target Docker: only use `render` to get the input
-specs, then drive the in-image agent as in the real-Orbi phase of
-[`verify/container.sh`](../verify/container.sh). Unlike that phase, supply
-valid credentials and require a real PR, not an expected auth failure.
+Use a trusted local Docker daemon on the same platform as the AX worker,
+able to pull the image by digest and bind-mount private specs. Use disposable
+credentials and a new named volume. `bin/ax-orbi` cannot target Docker: use
+`render` to get the input specs, then drive the in-image agent as in the
+real-Orbi phase of [`verify/container.sh`](../verify/container.sh). Unlike
+that phase, supply valid credentials and require a real PR, not an expected
+auth failure.
 
 1. Set `IMAGE` to the digest reference used by AX and `CONTAINER` to an unused
    Docker name. Save `docker version` and prepare the specs. JSON files are
    valid YAML inputs for the pinned runner. Keep the rendered Workspace clone
    and Task command/config, remove Gateway bindings and the two placeholder
-   variables so they don't override Docker's real environment. Keep these
-   files and the same volume for the replacement container.
+   variables so they don't override Docker's real environment. Stop if
+   rendering or generating the specs fails. Keep these files and the same
+   volume for the replacement container.
 
    ```bash
    timeout 30s docker version
@@ -466,9 +530,9 @@ valid credentials and require a real PR, not an expected auth failure.
    bounded startup budget (e.g. 300 seconds) until both HTTP checks succeed and
    status reports `started: true` and `ready: true`. If not ready, save the
    redacted prepare diagnostics and fix the failure before requesting work.
-   Match Q-B's CPU and memory
-   limits with Docker's `--cpus` and `--memory` if available; below shows the
-   example limits. Record any difference. Don't expose the runner port.
+   Match Q-B's CPU and memory limits with Docker's `--cpus` and `--memory` if
+   available; below shows the example limits with Docker swap disabled. Record
+   any difference. Don't publish the runner port.
 
    ```bash
    start_baseline() (
@@ -480,8 +544,8 @@ valid credentials and require a real PR, not an expected auth failure.
      [[ -n "$GH_TOKEN" && -n "$PI_API_KEY" ]] || exit 1
      export GH_TOKEN PI_API_KEY
      time timeout 60s docker run -d --name "$CONTAINER" -v "$VOL:/workspace" \
-       -v "$SPEC:/spec:ro" -e GH_TOKEN -e PI_API_KEY --cpus 2 --memory 4g "$IMAGE" \
-       --task-file /spec/task.yaml --workspace-file /spec/workspace.yaml --port 8080
+       -v "$SPEC:/spec:ro" -e GH_TOKEN -e PI_API_KEY --cpus 2 --memory 4g --memory-swap 4g \
+       "$IMAGE" --task-file /spec/task.yaml --workspace-file /spec/workspace.yaml --port 8080
    )
    start_baseline
    timeout 15s docker exec "$CONTAINER" curl -fsS http://127.0.0.1:8080/healthz
@@ -489,26 +553,29 @@ valid credentials and require a real PR, not an expected auth failure.
    timeout 30s docker exec "$CONTAINER" /usr/local/bin/ax-orbi-agent status --json
    ```
 
-3. **Delivery pair (Q-B).** Create a fresh comparable Issue and use Q-B's
-   snapshot commands before and after. Request a tick; set `RUN_ID` to the
-   returned `id`. Poll `status` until terminal within the same tick budget as
-   Q-B; collect `logs`, model evidence and the real PR link. The agent status
-   command's exit is not the tick exit; record `status`, `exitCode`, timestamps,
-   agent tick ID, Orbi delivery run ID and exact redacted tick output.
+3. **Delivery pair (Q-B).** Use Q-B step 1 with `FIXTURE=c`. Request a tick;
+   set `RUN_ID` to the returned `id`. Poll `status` for that ID within the
+   same tick budget as Q-B. The agent status command's exit is not the tick
+   exit; record `status`, `exitCode`, timestamps, agent tick ID, Orbi delivery
+   run ID and exact redacted tick output. Capture GitHub again to get the
+   linked PR and record model evidence as in Q-B.
 
    ```bash
-   timeout 30s docker exec "$CONTAINER" /usr/local/bin/ax-orbi-agent request-tick
+   time timeout 30s docker exec "$CONTAINER" /usr/local/bin/ax-orbi-agent request-tick
+   # After setting RUN_ID from the request, repeat status until terminal:
    timeout 30s docker exec "$CONTAINER" /usr/local/bin/ax-orbi-agent status --json --run "$RUN_ID"
    timeout 30s docker exec "$CONTAINER" /usr/local/bin/ax-orbi-agent logs --run "$RUN_ID" --tail 1000
+   # If truncated, collect the complete file privately as in Q-B:
+   timeout 60s docker exec "$CONTAINER" cat "/workspace/.ax-orbi/runs/$RUN_ID/tick.log"
    github_snapshot
    ```
 
 4. **Interruption pair (Q-C).** After the first tick and delivery are terminal,
-   create another fresh, comparable Issue and set `ISSUE_URL` to its URL. Write
-   the marker below, then use step 3's request/status commands with the
-   returned ID as `OLD_RUN_ID`. Once the
-   same tick is `running` and Orbi has claimed the Issue, capture the same
-   run and GitHub snapshots as Q-C. Stop the container with a 20-second grace
+   use Q-B step 1 with `FIXTURE=d`. Write the marker below, request one tick
+   with step 3's `request-tick`, and set both `RUN_ID` and `OLD_RUN_ID` to the
+   new ID. Sample step 3's `status` without waiting for terminal. Once the same
+   tick is `running` and Orbi has claimed the Issue, capture the same run and
+   GitHub evidence as Q-C. Stop the container with a 20-second grace
    period (the runner gets SIGTERM); save redacted `docker logs` and remove the
    stopped container, not the volume. Start a **new** container on that same
    volume with the same specs and image; run step 2's readiness checks against
@@ -532,14 +599,18 @@ valid credentials and require a real PR, not an expected auth failure.
    github_snapshot
    ```
 
-5. Use step 3 to request one new tick; collect its terminal status and logs,
-   plus the old tick status/logs, tick counts (`status --json`) and GitHub
-   history again. Apply Q-C's no-replay and no-duplicate checks. Record what
-   Orbi did with the existing delivery. Measure elapsed start/stop/restore
-   and tick time, human steps and setup/troubleshooting effort for both
-   systems. Once all evidence is secured and no other trial needs the volume,
-   stop and remove the replacement container, remove the test volume and
-   private temporary specs, and revoke the disposable credentials.
+5. If the stop hit active work, check whether `OLD_RUN_ID` is `interrupted`
+   with its original start time and boot ID. Record any difference from Q-C.
+   Once ready and idle with no queued requests, request one new tick as in
+   step 3 and use its ID as `RUN_ID`. Save its terminal status and logs,
+   then collect `OLD_RUN_ID` status/logs again and compare the tick counts
+   (agent `status --json`) and GitHub history. Apply Q-C's no-replay and
+   no-duplicate checks. Record what Orbi did with the existing delivery.
+   Measure elapsed start/stop/restore and tick time, human steps and
+   setup/troubleshooting effort for both systems. Once all evidence is secured
+   and no other trial needs the volume, stop and remove the replacement
+   container, remove the test volume and private temporary specs, and revoke
+   the disposable credentials.
 
 **Expected:** The same real delivery and interruption checks can be evaluated
 on Docker, with explicit environment credentials and a manually reused named
@@ -588,9 +659,10 @@ verify the same deployment is genuinely `Suspended` with no queued work.
    timeout 180s bin/ax-orbi inspect --json
    ```
 
-2. Once the task is checkpointed, explicitly authorize the agent to inspect
-   and recover only that task, verify the resulting health, and report what
-   was or wasn't recovered. Do not authorize a new tick. Expect:
+2. Once the task is checkpointed, ask: “Using the ax-orbi skill, inspect and
+   recover only this deployment. Verify its health afterward and report what
+   was or wasn't recovered. Do not request a new tick.” Save the commands and
+   answer. Expect:
 
    ```bash
    timeout 180s bin/ax-orbi inspect --json
