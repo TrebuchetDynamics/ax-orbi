@@ -84,23 +84,43 @@ Run this in Bash. If the installer downloaded `kubectl`, add `$HOME/.ax/bin` to 
 **Not yet verified on a live cluster.** Run each command from the ax-orbi checkout. Continue only after each succeeds.
 
 ```bash
-bin/ax-orbi check
-bin/ax-orbi prepare
-bin/ax-orbi run
-bin/ax-orbi inspect
+bin/ax-orbi check --json
+bin/ax-orbi prepare --json
+bin/ax-orbi run --json
+bin/ax-orbi inspect --json
 ```
 
-- `check` should report `ready`. If it reports `secret:github` or `secret:model` as not found, check the Kubernetes context and the `namespace/name` in the config, then create and label the corresponding Secret. If it warns that the label is missing, add it before preparing. A Gateway 403 can also mean the credential provider policy does not grant access.
-- `prepare` applies the Gateway, Workspace and Task and checks agent readiness. It does not start a delivery. If the config is missing, copy the [example](../examples/minimal/ax-orbi.toml), edit it as above and retry.
-- `run` requests one tick. Set `RUN_ID` to the ID printed by `run`, then use `bin/ax-orbi inspect --run "$RUN_ID" --logs` to inspect that run and its log. Check GitHub for the actual issue and PR state: a successful tick can find no eligible work.
+- `check` should exit 0, possibly with warnings. If it reports `secret:github` or `secret:model` as not found, check the Kubernetes context and the `namespace/name` in the config, then create and label the corresponding Secret. If it warns that the label is missing, add it before preparing. A Gateway 403 can also mean the credential provider policy does not grant access.
+- `prepare` applies the Gateway, Workspace and Task and checks agent readiness and image pins. It does not start a delivery. If the config is missing, copy the [example](../examples/minimal/ax-orbi.toml), edit it as above and retry.
+- `run` requests one tick. Set `RUN_ID` to `run.id` from its JSON, then use `bin/ax-orbi inspect --json --run "$RUN_ID" --logs` to inspect the run and its log. Check GitHub for the actual issue and PR state: a tick with `status: succeeded` can find no eligible work.
 
 ## 6. Stop and recover
 
-**Not yet verified on a live cluster.** Wait for the sandbox to be idle (`bin/ax-orbi inspect`), then stop it. This checkpoints `/workspace` rather than deleting your state. Recover when you want to use it again:
+**Not yet verified on a live cluster.** Wait for the sandbox to be idle (`bin/ax-orbi inspect --json`), then stop it. A normal stop requires evidence of idleness and checkpoints `/workspace` rather than deleting your state. Recover when you want to use it again:
 
 ```bash
-bin/ax-orbi stop
-bin/ax-orbi recover
+bin/ax-orbi stop --json
+bin/ax-orbi recover --json
 ```
 
-`recover` resumes the sandbox and reports any interrupted tick. Interrupted ticks are kept as evidence, not rerun; the next `bin/ax-orbi run` lets Orbi pick up delivery from the GitHub record.
+`recover` resumes the sandbox and reports interrupted run IDs in `interrupted`. Interrupted ticks are kept as evidence, not rerun; the next `bin/ax-orbi run --json` lets Orbi pick up delivery from the GitHub record. Requests that were queued before the stop may run on resume.
+
+## Interpreting results
+
+Exit code `0` means the command succeeded, not necessarily that the sandbox is running or a delivery merged. `1` is a failed operation, check or tick (`check` also uses `1` for invalid config); `2` is bad usage or configuration; `3` means interrupted, still pending or unknown. Read each check's `detail` and `fix` when present. `ok: null` is a warning. `check --json` lists these warning names in `unverified`, even when it exits 0. At the pinned AX revision, `ax-server` remains unverified because AX does not report the server revision. A check skipped with `--offline` is not verified either.
+
+`check` reports `image-pinned` for a configured digest reference. `prepare`, `run`, `inspect` (on an active task) and `recover` use `image-pins` to compare the running image's reported pins with [`versions.toml`](../versions.toml). If the current boot has no prepare report, retry inspect after startup. For missing or mismatching pins in the report, rebuild and push the image, set its new digest in `image.ref`, and prepare under a new deployment `name`. Do not leave two active deployments on the same repository.
+
+`taskState` records what AX reported, which can be the state observed before a resume. Use a fresh inspect to see the current state.
+
+| `taskState` | `inspect` exit | Meaning |
+| --- | --- | --- |
+| `Working` | `0` or `1` | Active; inspect also checks the live supervisor, readiness and image pins. |
+| `Suspended` | `0` | Checkpointed; state kept, nothing running. |
+| `Queued`, `Suspending` | `3` | Transitional. Prepare, run and recover wait up to their startup budget; inspect does not. |
+| `Failed`, `Cancelled`, `Completed`, `Terminating` | `1` | Not usable; follow the task diagnosis in `fix`. |
+| `Idle`, `RequiresAction`, `Unknown`, or an unrecognized label | `3` | State unrecognized by ax-orbi; do not treat it as checkpointed. |
+| `NotFound` | `1` | Task absent in the selected context and atespace. Normal stop is a no-op. |
+| `null` | `1` | The task lookup failed; check the AX control plane and context. Not proof that the task is absent. |
+
+A normal stop exits `1` if a tick is observed running, or `3` if it cannot confirm idleness and does not know of a running tick. Inspect before retrying. A forced stop can succeed and still report `executionUnknown: true`; that means execution at the time of suspension couldn't be confirmed, not that a tick definitely stopped or failed.
