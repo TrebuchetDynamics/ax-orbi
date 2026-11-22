@@ -1,0 +1,46 @@
+# Copy to ax-orbi.toml and replace the placeholders before deploying.
+# Lowercase deployment name; use a disposable repository for the first run.
+name = "demo"
+
+[repository]
+source = "example/demo" # Replace with your disposable GitHub OWNER/REPO.
+base_branch = "main"    # Branch Orbi works against.
+
+[image]
+# Replace the entire reference with the one printed by ax-orbi build --push.
+ref = "localhost:5001/ax-orbi@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+[resources]
+cpu = "2"       # Kubernetes CPU limit.
+memory = "4Gi"  # Kubernetes memory limit.
+
+[credentials.github]
+secret = "ax-system/orbi-demo-github" # Kubernetes namespace/Secret name, not a value.
+token_key = "token"                  # Key for the GitHub API bearer token.
+basic_key = "basic"                  # Key for Git over HTTPS Basic authentication.
+
+[model]
+provider = "demo"                             # Pi provider name.
+model = "replace-with-model-id"                # Model ID at your provider.
+base_url = "https://model.example.invalid/v1"  # Replace with the provider's HTTPS API base URL.
+# Optional Pi settings; these are the defaults for this API type.
+# api = "openai-completions"
+# context_window = 128000
+# max_tokens = 16384
+
+[credentials.model]
+secret = "ax-system/orbi-demo-model" # Kubernetes namespace/Secret name, not a value.
+key = "api-key"                      # Secret key containing the model API key.
+header = "authorization"             # HTTP header to replace.
+prefix = "Bearer "                   # Prefix AX adds; the trailing space matters.
+
+[network]
+allow = [] # Additional HTTPS DNS names; GitHub and the model host are already included.
+
+[ax]
+atespace = "default" # AX atespace where the manifests are applied.
+bin = "ax"          # AX CLI on PATH, or an explicit path to the binary.
+# context = "ax-local" # Optional explicit Kubernetes context; otherwise use the active one.
+
+[orbi]
+# Optional Orbi settings. ax-orbi supplies the repository and base branch.
