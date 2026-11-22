@@ -545,11 +545,15 @@ class CliFlowTests(unittest.TestCase):
         self.assertEqual(self.prepare()[0], 0)
         self.env["FAKE_AX_FAIL_SSH"] = "1"
 
-        code, out = self.cli("stop")
-        self.assertEqual(code, 3, out)
-        self.assertEqual(self.task_state()["phase"], "Working")
-        self.assertIn("--force", out["checks"][-1]["fix"])
-        self.assertIn("simulated SSH failure", out["checks"][-1]["detail"])
+        idle = {"supervisorAlive": True, "health": {"state": "idle", "currentRun": None}, "counts": {}}
+        for stdout in ("", json.dumps(idle)):
+            with self.subTest(stdout=stdout):
+                self.env["FAKE_AX_STATUS"] = stdout
+                code, out = self.cli("stop")
+                self.assertEqual(code, 3, out)
+                self.assertEqual(self.task_state()["phase"], "Working")
+                self.assertIn("--force", out["checks"][-1]["fix"])
+                self.assertIn("simulated SSH failure", out["checks"][-1]["detail"])
         self.assertNotIn("suspend", [call[0] for call in self.ax_calls()])
 
         code, out = self.cli("stop", "--force")
@@ -702,6 +706,32 @@ class CliFlowTests(unittest.TestCase):
         code, out = self.cli("inspect")
         self.assertEqual(code, 1)
         self.assertIn("ax-orbi prepare", out["checks"][0]["fix"])
+
+    def test_inspect_reports_missing_run_from_agent(self):
+        self.assertEqual(self.prepare()[0], 0)
+        code, out = self.cli("inspect", "--run", "not-requested")
+        self.assertEqual(code, 1, out)
+        self.assertIn({"name": "run", "ok": False, "detail": "no such run not-requested"},
+                      out["checks"])
+        self.assertIs(out["status"]["supervisorAlive"], True)
+
+    def test_delete_accepts_an_already_absent_task(self):
+        code, out = self.cli("stop", "--delete", "--yes-delete-state")
+        self.assertEqual(code, 0, out)
+        self.assertIn({"name": "delete:task", "ok": True, "detail": "orbi-demo already absent"},
+                      out["checks"])
+
+    def test_delete_does_not_treat_a_missing_ax_binary_as_deleted(self):
+        self.assertEqual(self.prepare()[0], 0)
+        self.config.write_text(self.config.read_text().replace(str(FAKES / "ax"),
+                                                               str(self.sb.tmp / "missing-ax")))
+        code, out = self.cli("stop", "--delete", "--yes-delete-state")
+        self.assertEqual(code, 1, out)
+        for kind in ("task", "workspace", "gateway"):
+            check = next(c for c in out["checks"] if c["name"] == f"delete:{kind}")
+            self.assertIs(check["ok"], False)
+            self.assertIn("not found on PATH", check["detail"])
+        self.assertEqual(self.task_state()["phase"], "Working")
 
     def test_delete_needs_explicit_confirmation(self):
         self.assertEqual(self.prepare()[0], 0)

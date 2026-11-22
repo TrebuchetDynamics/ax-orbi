@@ -291,18 +291,22 @@ class Ax:
                 return cols[2]
         return ""
 
-    def agent(self, task: str, *args: str, timeout: float = 120) -> tuple[dict | None, str]:
+    def agent(self, task: str, *args: str, timeout: float = 120,
+              allow_status_error: bool = False) -> tuple[dict | None, str]:
         """Run ax-orbi-agent in the sandbox; return (parsed JSON, error)."""
         code, out, err = self.run("ssh", task, "--", "/usr/local/bin/ax-orbi-agent", *args,
                                   timeout=timeout)
-        if code == 0:
+        if code == 0 or allow_status_error:
             for line in reversed(out.splitlines()):
                 line = line.strip()
                 if line.startswith("{"):
                     try:
-                        return json.loads(line), ""
+                        status = json.loads(line)
                     except ValueError:
                         break
+                    if code == 0 or status.get("error"):
+                        return status, ""
+                    break
         return None, (err.strip() or out.strip() or f"ax ssh exited {code}")
 
 
@@ -647,7 +651,8 @@ def cmd_inspect(args, report: Report) -> int:
         return report.finish(report_task_error(report, n["task"], state, kind))
     report.check("task", True, f"{n['task']} is {state}")
     extra = ["--run", args.run] if args.run else ["--limit", str(args.limit)]
-    status, err = ax.agent(n["task"], "status", "--json", *extra)
+    # `status --run` exits nonzero with a structured error for a missing run.
+    status, err = ax.agent(n["task"], "status", "--json", *extra, allow_status_error=bool(args.run))
     ready = report_prepare(report, status, err)
     runs = (status or {}).get("runs", [])
     if status and status.get("error"):
@@ -687,8 +692,13 @@ def cmd_stop(args, report: Report) -> int:
         report.check("task", None, detail.get(kind, f"{task} reported state {state!r}"))
         for resource, name in (("task", task), ("workspace", n["workspace"]), ("gateway", n["gateway"])):
             code, out, err = ax.run("delete", resource, name)
-            gone = code == 0 or "not found" in (out + err).lower()
-            report.check(f"delete:{resource}", gone, f"{name} deleted" if gone else (err or out).strip())
+            # Only AX's resource-level NotFound confirms the resource is already absent.
+            not_found = (f"Error: deleting {resource} {cfg['ax']['atespace']}/{name}: "
+                         f'rpc error: code = NotFound desc = {resource} "{name}" not found in atespace ')
+            absent = code == 1 and any(line.startswith(not_found) for line in err.splitlines())
+            detail = (f"{name} deleted" if code == 0 else f"{name} already absent" if absent
+                      else (err or out).strip() or f"ax delete {resource} exited {code}")
+            report.check(f"delete:{resource}", code == 0 or absent, detail)
         return report.finish(EXIT_OK if report.ok else EXIT_FAILED, interruptedRun=None)
     if kind == "missing":
         report.check("task", None, f"task {task} does not exist; nothing to stop")
