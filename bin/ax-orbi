@@ -357,16 +357,35 @@ def host_checks(report: Report, cfg: dict | None, versions: dict, cluster: bool)
                  f"build the ax CLI from {versions['ax']['repo']} at {versions['ax']['ref'][:12]} "
                  "(docs/SETUP.md) and add it to PATH")
     if found:
+        pinned = versions["ax"]["ref"][:12]
+        verified = None
         try:
-            out = subprocess.run([ax_bin, "version"], capture_output=True, text=True, timeout=30)
-            text = (out.stdout + out.stderr).strip()
+            proc = subprocess.run([ax_bin, "version"], capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            text = str(exc)
-        pinned = versions["ax"]["ref"]
-        matches = pinned in text or pinned[:7] in text
-        report.check("ax-version", True if matches else None, text.splitlines()[0] if text else "?",
-                     f"tested with google/ax {pinned[:12]}; the CLI, ax-server and the runner in the "
+            detail = f"could not run `ax version`: {exc}"
+        else:
+            line = proc.stdout.strip().partition("\n")[0]
+            match = re.match(r"ax version (\S+)(?:\s|$)", line)
+            version = match[1] if match else ""
+            source = re.fullmatch(r"dev\+([0-9a-f]{12})(-dirty)?", version)
+            if proc.returncode != 0:
+                error = proc.stderr.strip().partition("\n")[0] or line or "no output"
+                detail = f"`ax version` exited {proc.returncode}: {error}"
+            elif source and source[2]:
+                detail = f"-dirty build cannot verify a clean checkout: {line}"
+            elif source and source[1] != pinned:
+                detail = f"different commit: CLI {source[1]}, expected {pinned}"
+            elif source:
+                verified, detail = True, line
+            elif re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+                detail = f"release build cannot be compared with a commit pin: {line}"
+            else:
+                detail = f"`ax version` did not report a comparable revision: {line or 'no output'}"
+        report.check("ax-version", verified, detail,
+                     f"tested with google/ax {pinned}; the CLI, ax-server and the runner in the "
                      "image must come from the same commit")
+    report.check("ax-server", None,
+                 "server revision not verified: AX at the pinned commit does not report it")
     if cfg is None:
         return
     report.check("image-pinned", True, cfg["image"]["ref"])
@@ -413,8 +432,14 @@ def cmd_check(args, report: Report) -> int:
     except ConfigError as exc:
         report.check("config", False, str(exc))
     host_checks(report, cfg, versions, cluster=not args.offline)
-    report.say("ready" if report.ok else "not ready: fix the FAIL lines above")
-    return report.finish(EXIT_OK if report.ok else EXIT_FAILED)
+    unverified = [c["name"] for c in report.data["checks"] if c["ok"] is None]
+    if not report.ok:
+        report.say("not ready: fix the FAIL lines above")
+    elif unverified:
+        report.say(f"ready, with {len(unverified)} items not verified")
+    else:
+        report.say("ready")
+    return report.finish(EXIT_OK if report.ok else EXIT_FAILED, unverified=unverified)
 
 
 def build_args(versions: dict) -> dict:
@@ -546,7 +571,24 @@ def report_prepare(report: Report, status: dict | None, err: str) -> bool:
     prep = status.get("prepare") or {}
     for item in prep.get("checks", []):
         report.check(f"sandbox:{item['name']}", item["ok"], item["detail"], item.get("fix", ""))
-    return bool(prep.get("ok")) and bool(status.get("supervisorAlive"))
+    versions = load_versions()
+    expected = {
+        "ax_ref": versions["ax"]["ref"], "orbi_tag": versions["orbi"]["tag"],
+        "orbi_commit": versions["orbi"]["commit"], "pi_version": versions["pi"]["version"],
+        "gh_version": versions["gh"]["version"],
+    }
+    image = prep.get("image")
+    image = image if isinstance(image, dict) else {}
+    differences = []
+    for pin, value in expected.items():
+        if image.get(pin) != value:
+            reported = repr(image[pin]) if pin in image else "<missing>"
+            differences.append(f"{pin}: image {reported}, expected {value!r}")
+    pins_match = report.check("image-pins", not differences,
+                              "; ".join(differences) or "image pins match versions.toml",
+                              "rebuild with `ax-orbi build --push`, set the new image digest, "
+                              "and prepare a deployment with a new `name`")
+    return bool(prep.get("ok")) and bool(status.get("supervisorAlive")) and pins_match
 
 
 def cmd_prepare(args, report: Report) -> int:

@@ -85,18 +85,24 @@ class Sandbox:
         (self.tmp / "deploy").mkdir()
         self.mode_file = self.tmp / "mode"
         self.tick_log = self.tmp / "ticks.log"
+        self.versions_file = self.tmp / "versions.json"
         self.set_mode("ok")
         self.env = dict(os.environ)
         self.env.update({
             "PATH": f"{FAKES}:{os.environ['PATH']}",
             "AX_ORBI_STATE_DIR": str(self.state),
             "AX_ORBI_ORBI_BIN": str(FAKES / "orbi"),
-            "AX_ORBI_VERSIONS_FILE": str(self.tmp / "versions.json"),
+            "AX_ORBI_VERSIONS_FILE": str(self.versions_file),
             "FAKE_ORBI_MODE_FILE": str(self.mode_file),
             "FAKE_ORBI_LOG": str(self.tick_log),
             "GH_TOKEN": "placeholder",
         })
-        (self.tmp / "versions.json").write_text('{"orbi_tag": "v9.9.9"}')
+        pins = cli.load_versions()
+        self.versions_file.write_text(json.dumps({
+            "ax_ref": pins["ax"]["ref"], "orbi_tag": pins["orbi"]["tag"],
+            "orbi_commit": pins["orbi"]["commit"], "pi_version": pins["pi"]["version"],
+            "gh_version": pins["gh"]["version"],
+        }))
         if with_config:
             self.env["AX_ORBI_CONFIG"] = json.dumps({
                 "source_repo": "example/demo", "repo_dir": str(self.repo),
@@ -271,7 +277,8 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(sb.ticks(), 0)
         toml = (sb.state / "orbi.toml").read_text()
         self.assertIn('source_repos = ["example/demo"]', toml)
-        self.assertIn('engine_source_track = "tag:v9.9.9"', toml)
+        tag = cli.load_versions()["orbi"]["tag"]
+        self.assertIn(f'engine_source_track = "tag:{tag}"', toml)
         self.assertIn('git_transport = "https"', toml)
         providers = json.loads((sb.state / "pi-providers.json").read_text())
         self.assertEqual(providers["providers"]["p"]["apiKey"], "$PI_API_KEY")
@@ -453,6 +460,30 @@ class CliConfigTests(unittest.TestCase):
                 cli.load_config(self.write(text))
             self.assertIn(expected, str(ctx.exception))
 
+    def test_check_distinguishes_ax_revision_warnings(self):
+        versions = cli.load_versions()
+        pin = versions["ax"]["ref"][:12]
+        other = f"{pin[:-1]}{'1' if pin.endswith('0') else '0'}"
+        cases = (
+            (f"dev+{pin}", 0, True, pin),
+            (f"dev+{other}", 0, None, "different commit"),
+            (f"dev+{pin}-dirty", 0, None, "-dirty build"),
+            ("v1.2.3", 0, None, "release build cannot be compared with a commit pin"),
+            ("dev", 0, None, "did not report a comparable revision"),
+            (f"dev+{pin}", 1, None, "exited 1"),
+        )
+        for version, code, ok, detail in cases:
+            with self.subTest(version=version, code=code):
+                report = cli.Report(as_json=True)
+                result = subprocess.CompletedProcess(
+                    ["ax", "version"], code, f"ax version {version} (API v1alpha1)\n", "")
+                with patch.object(cli.shutil, "which", return_value="/fake/ax"), \
+                     patch.object(cli.subprocess, "run", return_value=result):
+                    cli.host_checks(report, None, versions, cluster=False)
+                check = next(c for c in report.data["checks"] if c["name"] == "ax-version")
+                self.assertIs(check["ok"], ok)
+                self.assertIn(detail, check["detail"])
+
     def test_model_is_optional(self):
         text = CONFIG.split("[model]")[0] + '[credentials.github]\nsecret = "ax-system/s"\n'
         cfg = cli.load_config(self.write(text))
@@ -477,9 +508,12 @@ class CliFlowTests(unittest.TestCase):
         subprocess.run([str(FAKES / "ax"), "suspend", "task", "orbi-demo"], env=self.env,
                        capture_output=True)
 
-    def cli(self, *args: str):
-        proc = subprocess.run([sys.executable, str(CLI), *args, "-c", str(self.config), "--json"],
+    def cli_process(self, *args: str):
+        return subprocess.run([sys.executable, str(CLI), *args, "-c", str(self.config)],
                               env=self.env, capture_output=True, text=True, timeout=120)
+
+    def cli(self, *args: str):
+        proc = self.cli_process(*args, "--json")
         try:
             return proc.returncode, json.loads(proc.stdout)
         except ValueError:
@@ -510,6 +544,58 @@ class CliFlowTests(unittest.TestCase):
                        input=cli.render(cli.load_config(self.config)), text=True, capture_output=True)
         self.fix_repo_path()
         return self.cli("prepare", "--timeout", "30")
+
+    def test_check_lists_unverified_versions(self):
+        code, out = self.cli("check", "--offline")
+        self.assertEqual(code, 0, out)
+        self.assertCountEqual(out["unverified"], ["ax-version", "ax-server"])
+        checks = {c["name"]: c for c in out["checks"]}
+        self.assertIsNone(checks["ax-version"]["ok"])
+        self.assertIn("ax fake", checks["ax-version"]["detail"])
+        self.assertIsNone(checks["ax-server"]["ok"])
+        self.assertEqual(checks["ax-server"]["detail"],
+                         "server revision not verified: AX at the pinned commit does not report it")
+
+        proc = self.cli_process("check", "--offline")
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual(proc.stdout.splitlines()[-1], "ready, with 2 items not verified")
+        self.assertEqual(self.ax_calls(), [["version"], ["version"]])
+
+    def test_image_pin_mismatch_fails_readiness(self):
+        versions_file = self.sb.versions_file
+        matching = json.loads(versions_file.read_text())
+        tag = matching["orbi_tag"]
+        different_tag = f"{tag}-mismatch"
+        mismatched = dict(matching, orbi_tag=different_tag)
+        del mismatched["pi_version"]
+        versions_file.write_text(json.dumps(mismatched))
+        prepare_code, prepare_out = self.prepare()
+
+        code, out = self.cli("inspect")
+        self.assertEqual(code, 1, out)
+        pins = next(c for c in out["checks"] if c["name"] == "image-pins")
+        self.assertIs(pins["ok"], False)
+        self.assertIn(f"orbi_tag: image {different_tag!r}, expected {tag!r}", pins["detail"])
+        self.assertIn(f"pi_version: image <missing>, expected {matching['pi_version']!r}", pins["detail"])
+        self.assertIn("ax-orbi build --push", pins["fix"])
+        self.assertIn("new `name`", pins["fix"])
+        self.assertEqual(prepare_code, 1, prepare_out)
+        proc = self.cli_process("inspect")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"[FAIL] image-pins: {pins['detail']}", proc.stdout)
+        self.assertIn(pins["fix"], proc.stdout)
+
+        code, out = self.cli("run", "--no-wait", "--start-timeout", "3")
+        self.assertEqual(code, 1, out)
+        self.assertFalse(any("request-tick" in call for call in self.ax_calls()))
+
+        self.assertEqual(self.cli("stop")[0], 0)
+        versions_file.write_text(json.dumps(matching))
+        code, out = self.cli("recover", "--timeout", "30")
+        self.assertEqual(code, 0, out)
+        code, out = self.cli("inspect")
+        self.assertEqual(code, 0, out)
+        self.assertIs(next(c for c in out["checks"] if c["name"] == "image-pins")["ok"], True)
 
     def test_prepare_run_inspect_stop_recover(self):
         code, out = self.prepare()
