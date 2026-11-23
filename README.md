@@ -45,7 +45,7 @@ Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `--json`
 | `inspect` | Reports sandbox health, recent runs and their evidence. |
 | `stop` | Pauses an enabled deployment and checkpoints the sandbox, keeping state by default. |
 | `recover` | Resumes a checkpointed sandbox and reports interrupted runs. |
-| `enable NAME` or `enable --config PATH` | Installs the pinned AX CLI if needed (only for the default `ax`), starts a local cluster only if AX is unreachable and `[ax] local = true`, and enables the deployment after host checks pass. `--config` also registers the file. `--no-install` skips host preparation and checks. `--build-image` builds and pushes the task image first; if the digest differs, update `image.ref` yourself and retry. |
+| `enable NAME` or `enable --config PATH` | Installs the pinned AX CLI if needed (only for the default `ax`), starts a local cluster only if AX is unreachable and `[ax] local = true`, and enables the deployment after host checks pass. `--config` also registers the file. `--no-install` skips host preparation and checks. `--build-image` builds and pushes to the default registry (`localhost:5001`) before host setup; the registry must already be reachable. If the digest differs, update `image.ref` yourself and retry. The Go build and Docker local-cluster startup are not yet verified on a live cluster. |
 | `pause NAME [--reason TEXT]` | Records a pause without changing the AX sandbox. |
 | `resume NAME` | Re-enables a paused deployment without changing the AX sandbox. |
 | `status [NAME]` | Lists fleet deployments, their recorded modes and watch phase, detail and age without contacting AX. |

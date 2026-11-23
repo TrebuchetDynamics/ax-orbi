@@ -101,6 +101,16 @@ binary.write_text("#!/usr/bin/env python3\\n" + {self.ax_script!r}.replace("REVI
 binary.chmod(0o755)
 print("fake go built AX")
 ''')
+        self.program("make", f'''import os, subprocess, sys
+from pathlib import Path
+with Path(os.environ["HOME"], "make.log").open("a") as log:
+    print(" ".join(sys.argv[1:]), file=log)
+assert Path.cwd() == Path({str(self.ax_source)!r})
+assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=5).strip() == {self.pin!r}
+assert os.environ["GOTOOLCHAIN"] == "auto"
+Path(os.environ["HOME"], "cluster-up").touch()
+print("fake make started AX")
+''')
         self.deployment = self.fleet / "demo.toml"
         self.deployment.parent.mkdir()
         self.deployment.write_text(CONFIG)
@@ -156,9 +166,40 @@ print("fake go built AX")
         newer = self.git_run(self.source, "rev-parse", "HEAD")
         self.program("ax", self.ax_script.replace("REVISION", newer[:12]))
         self.command("enable", "demo")
-        self.assertEqual((self.root / "git.log").read_text().splitlines(), ["fetch", "checkout", "rev-parse"])
+        self.assertEqual((self.root / "git.log").read_text().splitlines(),
+                         ["rev-parse", "status", "fetch", "checkout", "rev-parse"])
         self.assertTrue(self.ax_bin.exists())
         self.assertEqual(self.git_run(self.ax_source, "rev-parse", "HEAD"), self.pin)
+
+    def test_enable_does_not_checkout_in_an_enclosing_repo(self):
+        self.git_run(self.root, "init", "-q", "-b", "owner")
+        self.git_run(self.root, "commit", "-qm", "owner", "--allow-empty")
+        head = self.git_run(self.root, "rev-parse", "HEAD")
+        self.ax_source.mkdir(parents=True)
+        failure = self.command("enable", "demo", code=1)["checks"][-1]
+        self.assertIn("not an AX checkout", failure["detail"])
+        self.assertIn(str(self.ax_source), failure["fix"])
+        self.assertEqual(self.git_run(self.root, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git_run(self.root, "rev-parse", "--abbrev-ref", "HEAD"), "owner")
+        self.assertEqual((self.root / "git.log").read_text().splitlines(), ["rev-parse"])
+        self.assertFalse((self.root / "go.log").exists())
+        self.assertFalse(self.desired.exists())
+
+    def test_enable_does_not_start_from_modified_ax_source(self):
+        self.matching_ax()
+        self.env["FAKE_AX_FAIL_GET"] = "1"
+        self.deployment.write_text(CONFIG + "\n[ax]\nlocal = true\n")
+        self.home.mkdir()
+        self.git_run(self.home, "clone", "-q", str(self.source), str(self.ax_source))
+        modified = self.ax_source / "Makefile"
+        modified.write_text("local changes\n")
+        self.git_run(self.ax_source, "add", modified.name)
+        failure = self.command("enable", "demo", code=1)["checks"][-1]
+        self.assertIn("local changes", failure["detail"])
+        self.assertIn(str(self.ax_source), failure["fix"])
+        self.assertEqual(modified.read_text(), "local changes\n")
+        self.assertFalse((self.root / "make.log").exists())
+        self.assertFalse(self.desired.exists())
 
     def test_enable_does_not_replace_a_configured_binary(self):
         self.matching_ax()  # A valid default on PATH must not mask a custom mismatch.
@@ -177,16 +218,6 @@ print("fake go built AX")
     def test_cluster_is_started_only_when_local_is_set(self):
         self.matching_ax()
         self.env["FAKE_AX_FAIL_GET"] = "1"
-        self.program("make", f'''import os, subprocess, sys
-from pathlib import Path
-with Path(os.environ["HOME"], "make.log").open("a") as log:
-    print(" ".join(sys.argv[1:]), file=log)
-assert Path.cwd() == Path({str(self.ax_source)!r})
-assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=5).strip() == {self.pin!r}
-assert os.environ["GOTOOLCHAIN"] == "auto"
-Path(os.environ["HOME"], "cluster-up").touch()
-print("fake make started AX")
-''')
         proc = self.process("enable", "demo")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("ax-cluster: cannot connect to AX", proc.stdout)
@@ -275,6 +306,18 @@ sys.exit(1)
         calls = (self.root / "go.log").read_text().splitlines()
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.status()["desired"], "enabled")
+
+    def test_build_image_does_not_enable_if_no_digest_was_reported(self):
+        self.program("docker", '''import sys
+if sys.argv[1:3] == ["image", "inspect"]:
+    print("null")
+''')
+        failure = self.command("enable", "demo", "--build-image", code=1)["checks"][-1]
+        self.assertEqual(failure["name"], "push")
+        self.assertIn("no digest was reported", failure["detail"])
+        self.assertIn("imagetools inspect", failure["fix"])
+        self.assert_no_install_commands()
+        self.assertFalse(self.desired.exists())
 
     def test_build_image_requires_the_owner_to_update_the_digest(self):
         ref = "localhost:5001/ax-orbi@sha256:" + "b" * 64
