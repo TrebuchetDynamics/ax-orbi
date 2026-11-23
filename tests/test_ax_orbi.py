@@ -166,7 +166,18 @@ class Sandbox:
         return json.loads(out)
 
     def wait_ready(self):
-        wait_until(lambda: self.status()["started"], what="supervisor")
+        proc = self.procs[-1]
+
+        def started():
+            if proc.poll() is not None:
+                output, _ = proc.communicate(timeout=1)
+                raise AssertionError(f"supervisor exited {proc.returncode}:\n{output}")
+            status = self.status()
+            # A resumed supervisor can acquire the lock before publishing its
+            # health, while both status files still describe the previous boot.
+            return status["started"] and status["health"]["pid"] == proc.pid
+
+        wait_until(started, what=f"supervisor {proc.pid}")
 
     def wait_status(self, run_id: str, *statuses: str) -> dict:
         return wait_until(lambda: (r := self.run_record(run_id))["status"] in statuses and r,
