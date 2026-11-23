@@ -94,6 +94,8 @@ class Sandbox:
         self.env = dict(os.environ)
         self.env.update({
             "PATH": f"{FAKES}:{os.environ['PATH']}",
+            "AX_ORBI_HOME": str(self.tmp / "host-state"),
+            "AX_ORBI_FLEET": str(self.tmp / "fleet"),
             "AX_ORBI_STATE_DIR": str(self.state),
             "AX_ORBI_ORBI_BIN": str(FAKES / "orbi"),
             "AX_ORBI_VERSIONS_FILE": str(self.versions_file),
@@ -147,7 +149,8 @@ class Sandbox:
         return proc
 
     def agent(self, *args: str):
-        proc = subprocess.run([str(AGENT), *args], env=self.env, capture_output=True, text=True)
+        proc = subprocess.run([str(AGENT), *args], env=self.env, capture_output=True, text=True,
+                              timeout=5)
         return proc.returncode, proc.stdout
 
     def status(self, run: str | None = None) -> dict:
@@ -478,6 +481,18 @@ class AgentTests(unittest.TestCase):
         sb.configure_project()
         sb.request("t-retry")
         self.assertEqual(sb.wait_status("t-retry", "succeeded", "failed")["status"], "succeeded")
+
+    def test_setup_removing_check_fails_the_project_path_check(self):
+        sb = Sandbox(self)
+        sb.configure_project()
+        (sb.repo / "setup.sh").write_text("rm check.sh\n")
+        sb.serve()
+        sb.wait_ready()
+        prep = sb.status()["prepare"]
+        failure = next(c for c in prep["checks"] if not c["ok"])
+        self.assertEqual(failure["name"], "project:setup", prep)
+        self.assertIn("project.check", failure["fix"])
+        self.assertEqual(sb.ticks(), 0)
 
     def test_setup_without_check_runs_once_per_start(self):
         sb = Sandbox(self)

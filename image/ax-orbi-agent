@@ -288,46 +288,62 @@ def run_project_script(script: Path, repo_dir: Path, env: dict, timeout: int,
 def prepare_project(sdir: Path, repo_dir: Path, project: dict, env: dict, boot_id: str | None,
                     supervisor: Supervisor | None, report: dict, check) -> None:
     info = report["project"] = {"setupSha256": None, "ranSetup": False}
-    fix = "set project.{} to a script file inside the repository"
     repo_dir = repo_dir.resolve()
-    paths = {}
-    for key in ("setup", "check"):
-        if key == "check" and key not in project:
-            continue
+    log = sdir / "project-setup.log"
+    cache = sdir / "project-setup.json"
+
+    def stopping() -> bool:
+        return supervisor is not None and supervisor.stopping.is_set()
+
+    def result(ok: bool, detail: str, fix: str = "") -> None:
+        if stopping():
+            check("project:ready", False, "interrupted by stop")
+        else:
+            check("project:ready", ok, detail, fix)
+
+    def resolve_script(key: str, context: str = "") -> Path | None:
         try:
             path = (repo_dir / project[key]).resolve(strict=True)
             if not path.is_relative_to(repo_dir) or not path.is_file():
                 raise ValueError("not a file inside the repository")
-            paths[key] = path
             if key == "setup":
                 info["setupSha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            return path
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
-            check("project:setup", False, f"project.{key}: {exc}", fix.format(key))
-            return
+            if stopping():
+                result(False, "interrupted by stop")
+            else:
+                check("project:setup", False, f"project.{key}: {exc}{context}",
+                      f"set project.{key} to a script file inside the repository")
+            return None
 
-    log = sdir / "project-setup.log"
-    cache = sdir / "project-setup.json"
-    check_script = paths.get("check")
-
-    def probe() -> tuple[int, str]:
+    def probe(script: Path) -> tuple[int, str]:
         with tempfile.TemporaryFile() as output:
-            return run_project_script(check_script, repo_dir, env, 300, output, supervisor)
+            return run_project_script(script, repo_dir, env, 300, output, supervisor)
 
-    def result(ok: bool, detail: str, fix: str = "") -> None:
-        if supervisor is not None and supervisor.stopping.is_set():
-            check("project:ready", False, "interrupted by stop")
-        else:
-            check("project:ready", ok, detail, fix)
+    setup_script = resolve_script("setup")
+    if setup_script is None:
+        return
+    check_script = None
+    if "check" in project:
+        check_script = resolve_script("check")
+        if check_script is None:
+            return
 
     def describe(label: str, code: int, line: str) -> str:
         return f"{label} exit {code}" + (f": {line}" if line else "")
 
     if check_script is not None:
-        code, last = probe()
-        if code == 0 or not boot_id or (supervisor is not None and supervisor.stopping.is_set()):
+        code, last = probe(check_script)
+        if code == 0 or not boot_id or stopping():
             result(code == 0, describe("check", code, last) +
                    (f"; setup log: {log}" if code else ""),
                    "fix the check or start the supervisor to run setup")
+            return
+        # Either script may change the checkout. Resolve and validate the next
+        # script again rather than launching a path from before that change.
+        setup_script = resolve_script("setup")
+        if setup_script is None:
             return
     elif not boot_id:
         result(False, "setup requires a supervisor start", "start the supervisor to run setup")
@@ -339,16 +355,19 @@ def prepare_project(sdir: Path, repo_dir: Path, project: dict, env: dict, boot_i
     else:
         info["ranSetup"] = True
         with log.open("w+b") as output:
-            code, last = run_project_script(paths["setup"], repo_dir, env,
+            code, last = run_project_script(setup_script, repo_dir, env,
                                             project.get("setup_timeout", 1800), output, supervisor)
         if check_script is None:
             write_json(cache, {"bootId": boot_id, "exitCode": code, "lastLine": last})
     detail = describe("setup", code, last)
-    if check_script is not None and not (supervisor is not None and supervisor.stopping.is_set()):
-        code, last = probe()
+    if check_script is not None and not stopping():
+        check_script = resolve_script("check", f"; {detail}; see {log}")
+        if check_script is None:
+            return
+        code, last = probe(check_script)
         detail += "; " + describe("check", code, last)
     result(code == 0, detail if code == 0 else f"{detail}; see {log}",
-           "fix the project recipe and " + ("retry" if check_script else "restart the supervisor"))
+           "fix the project recipe and restart the supervisor")
 
 
 def prepare(sdir: Path, boot_id: str | None = None, *, supervisor: Supervisor | None = None) -> dict:
