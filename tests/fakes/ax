@@ -56,8 +56,14 @@ if cmd == "apply":
     if not state.get("applied"):
         cfg = next(l.split("value: ", 1)[1] for l in text.splitlines()
                    if "value: " in l and "source_repo" in l)
+        config = json.loads(cfg)
+        overrides = {key: os.environ[variable] for key, variable in
+                     (("repo_dir", "FAKE_AX_REPO_DIR"), ("deploy_home", "FAKE_AX_DEPLOY_HOME"))
+                     if variable in os.environ}
+        if overrides:
+            config = json.dumps(dict(json.loads(config), **overrides))
         state.update(applied=text, name=os.environ.get("FAKE_AX_TASK", "orbi-demo"),
-                     phase="Suspended", env={"AX_ORBI_CONFIG": json.loads(cfg), "GH_TOKEN": "placeholder"})
+                     phase="Suspended", env={"AX_ORBI_CONFIG": config, "GH_TOKEN": "placeholder"})
         save()
     print("task created"); sys.exit(0)
 if cmd == "get":

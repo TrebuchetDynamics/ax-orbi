@@ -184,6 +184,37 @@ class Sandbox:
                           what=f"run {run_id} to be {statuses}")
 
 
+class VerifierTests(unittest.TestCase):
+    def test_real_tick_classification(self):
+        # The real tick from PR #25's container job, with the traceback elided.
+        transport_error = """\
+Traceback (most recent call last):
+  File "/opt/orbi/src/orbi/git_transport.py", line 360, in check_transport
+    raise TransportError(
+orbi.git_transport.TransportError: transport_unreachable: git ls-remote https://github.com/example/demo.git failed: Command '['git', 'ls-remote', 'https://github.com/example/demo.git']' returned non-zero exit status 128. stderr=remote: Invalid username or token. Password authentication is not supported for Git operations.
+fatal: Authentication failed for 'https://github.com/example/demo.git/'
+"""
+        probe_failure, auth_failure = transport_error.splitlines()[-2:]
+        for expected, log in (
+            ("expected-failure", transport_error),
+            ("expected-failure", probe_failure),
+            ("expected-failure", auth_failure),
+            ("config-rejected", 'ERROR config_invalid reason="source_repos must be a non-empty list"\n'),
+            ("config-rejected", "ERROR config_not_found path=/tmp/absent-orbi.toml; "
+             "reason=no Orbi config at this path\n"),
+            ("unknown", "Traceback (most recent call last):\n"
+             "RuntimeError: failed to start with /workspace/.ax-orbi/orbi.toml\n"),
+            ("unknown", transport_error.replace("example/demo", "example/demo-other")),
+        ):
+            with self.subTest(expected=expected, log=log):
+                proc = subprocess.run(
+                    [str(ROOT / "verify" / "container.sh"), "--classify-real-tick", "example/demo"],
+                    input=log, text=True, capture_output=True, timeout=5,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, expected + "\n")
+
+
 class AgentTests(unittest.TestCase):
     def test_stop_before_launch_starts_nothing(self):
         sb = Sandbox(self)
