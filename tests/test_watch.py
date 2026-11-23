@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -50,6 +51,261 @@ class FleetTestCase(unittest.TestCase):
         return entry
 
 
+class EnableTests(FleetTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tools = self.root / "tools"
+        self.tools.mkdir()
+        self.git = shutil.which("git")
+        for tool in ("python3", "sh"):
+            (self.tools / tool).symlink_to(shutil.which(tool))
+        self.env.update(PATH=str(self.tools), HOME=str(self.root), GIT_CONFIG_NOSYSTEM="1")
+        self.program("git", f'''import os, sys
+with open(os.path.join(os.environ["HOME"], "git.log"), "a") as log:
+    print(sys.argv[1], file=log)
+os.execv({self.git!r}, [{self.git!r}, *sys.argv[1:]])
+''')
+        self.source = self.root / "upstream"
+        self.source.mkdir()
+        self.git_run(self.source, "init", "-q", "-b", "main")
+        self.git_run(self.source, "commit", "-qm", "pinned", "--allow-empty")
+        self.pin = self.git_run(self.source, "rev-parse", "HEAD")
+        self.git_run(self.source, "commit", "-qm", "newer", "--allow-empty")
+        versions = self.root / "versions.toml"
+        default_pins = (CLI.parent.parent / "versions.toml").read_text()
+        ax_pin = cli.load_versions(CLI.parent.parent / "versions.toml")["ax"]
+        versions.write_text(default_pins.replace(ax_pin["repo"], str(self.source))
+                            .replace(ax_pin["ref"], self.pin))
+        self.env["AX_ORBI_VERSIONS_TOML"] = str(versions)
+        self.ax_source = self.home / "ax-source"
+        self.ax_bin = self.home / "bin" / "ax"
+        self.ax_script = f'''import os, sys
+from pathlib import Path
+if sys.argv[1:] == ["version"]:
+    print("ax version dev+REVISION")
+    sys.exit(0)
+if os.environ.get("FAKE_AX_FAIL_GET") and Path(os.environ["HOME"], "cluster-up").exists():
+    del os.environ["FAKE_AX_FAIL_GET"]
+os.execv({str(FAKES / 'ax')!r}, [{str(FAKES / 'ax')!r}, *sys.argv[1:]])
+'''
+        self.program("go", f'''import json, os, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ["HOME"], "go.log").open("a") as log:
+    print(json.dumps(args), file=log)
+assert args == ["build", "-o", {str(self.ax_bin)!r}, "./cmd/ax"], args
+assert os.environ["GOTOOLCHAIN"] == "auto"
+rev = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=5).strip()
+binary = Path(args[2])
+binary.write_text("#!/usr/bin/env python3\\n" + {self.ax_script!r}.replace("REVISION", rev[:12]))
+binary.chmod(0o755)
+print("fake go built AX")
+''')
+        self.deployment = self.fleet / "demo.toml"
+        self.deployment.parent.mkdir()
+        self.deployment.write_text(CONFIG)
+
+    def git_run(self, path, *args):
+        return subprocess.run([self.git, "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+                              cwd=path, env=self.env, check=True, capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+
+    def program(self, name, script):
+        path = self.tools / name
+        path.write_text("#!/usr/bin/env python3\n" + script)
+        path.chmod(0o755)
+        return path
+
+    def test_enable_builds_the_pinned_ax_when_missing(self):
+        self.assertIsNone(shutil.which("ax", path=self.env["PATH"]))
+        config = self.deployment.rename(self.root / "ax-orbi.toml")
+        proc = subprocess.run([str(CLI), "enable", "--config", config.name, "--json"],
+                              env=self.env, cwd=self.root, capture_output=True, text=True, timeout=15)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["exitCode"], 0)
+        self.assertIn("fake go built AX", proc.stderr)
+        self.assertTrue(os.access(self.ax_bin, os.X_OK))
+        self.assertEqual(self.git_run(self.ax_source, "rev-parse", "HEAD"), self.pin)
+        self.assertEqual(self.git_run(self.ax_source, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
+        self.assertEqual(self.status()["desired"], "enabled")
+        self.assertEqual(self.deployment.readlink(), config)
+        checks = {c["name"]: c for c in self.command("check", "-c", str(config))["checks"]}
+        self.assertEqual(checks["ax"]["detail"], str(self.ax_bin))
+        self.assertEqual(checks["ax-version"]["detail"], f"ax version dev+{self.pin[:12]}")
+        self.assertIs(checks["ax-version"]["ok"], True)
+        self.assertIs(checks["ax-cluster"]["ok"], True)
+
+    def matching_ax(self):
+        return self.program("ax", self.ax_script.replace("REVISION", self.pin[:12]))
+
+    def assert_no_install_commands(self):
+        for name in ("git", "go", "make"):
+            self.assertFalse((self.root / f"{name}.log").exists(), f"unexpected {name} invocation")
+
+    def test_enable_skips_the_build_when_ax_matches(self):
+        self.matching_ax()
+        self.command("enable", "demo")
+        self.assert_no_install_commands()
+        self.assertFalse(self.ax_bin.exists())
+        self.assertEqual(self.status()["desired"], "enabled")
+
+    def test_enable_fetches_existing_source_when_default_ax_does_not_match(self):
+        self.home.mkdir()
+        self.git_run(self.home, "clone", "-q", str(self.source), str(self.ax_source))
+        newer = self.git_run(self.source, "rev-parse", "HEAD")
+        self.program("ax", self.ax_script.replace("REVISION", newer[:12]))
+        self.command("enable", "demo")
+        self.assertEqual((self.root / "git.log").read_text().splitlines(), ["fetch", "checkout", "rev-parse"])
+        self.assertTrue(self.ax_bin.exists())
+        self.assertEqual(self.git_run(self.ax_source, "rev-parse", "HEAD"), self.pin)
+
+    def test_enable_does_not_replace_a_configured_binary(self):
+        self.matching_ax()  # A valid default on PATH must not mask a custom mismatch.
+        newer = self.git_run(self.source, "rev-parse", "HEAD")
+        custom = self.program("owner-ax", self.ax_script.replace("REVISION", newer[:12]))
+        before = custom.read_bytes()
+        self.config(self.deployment, ax=custom)
+        failure = self.command("enable", "demo", code=1)["checks"][-1]
+        self.assertIn("different commit", failure["detail"])
+        self.assertIn('bin = "ax"', failure["fix"])
+        self.assertEqual(custom.read_bytes(), before)
+        self.assert_no_install_commands()
+        self.assertFalse(self.ax_bin.exists())
+        self.assertFalse(self.desired.exists())
+
+    def test_cluster_is_started_only_when_local_is_set(self):
+        self.matching_ax()
+        self.env["FAKE_AX_FAIL_GET"] = "1"
+        self.program("make", f'''import os, subprocess, sys
+from pathlib import Path
+with Path(os.environ["HOME"], "make.log").open("a") as log:
+    print(" ".join(sys.argv[1:]), file=log)
+assert Path.cwd() == Path({str(self.ax_source)!r})
+assert subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=5).strip() == {self.pin!r}
+assert os.environ["GOTOOLCHAIN"] == "auto"
+Path(os.environ["HOME"], "cluster-up").touch()
+print("fake make started AX")
+''')
+        proc = self.process("enable", "demo")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("ax-cluster: cannot connect to AX", proc.stdout)
+        self.assertIn("fix: start it with `ax local start` or select a cluster with `ax ctx`", proc.stdout)
+        self.assertFalse(self.desired.exists())
+        self.assert_no_install_commands()
+
+        self.deployment.write_text(CONFIG + "\n[ax]\nlocal = true\n")
+        proc = self.process("enable", "demo", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["exitCode"], 0)
+        self.assertIn("fake make started AX", proc.stderr)
+        self.command("enable", "demo")  # Once reachable, do not start it again.
+        self.assertEqual((self.root / "make.log").read_text().splitlines(),
+                         ["build-local-cluster CONTAINER_CLI=docker"])
+        self.assertFalse((self.root / "go.log").exists())
+        self.assertEqual(self.status()["desired"], "enabled")
+
+    def test_failed_check_leaves_the_deployment_not_enabled(self):
+        self.matching_ax()
+        # Use the documented fallback path, keeping kubectl off PATH.
+        kubectl = self.root / ".ax/bin/kubectl"
+        kubectl.parent.mkdir(parents=True)
+        self.program("kubectl", '''import json, os, sys
+with open(os.path.join(os.environ["HOME"], "kubectl.log"), "a") as log:
+    print(json.dumps(sys.argv[1:]), file=log)
+sys.exit(1)
+''').rename(kubectl)
+        result = self.command("enable", "demo", code=1)
+        failures = [c for c in result["checks"] if c["ok"] is False]
+        self.assertEqual([c["name"] for c in failures], ["secret:github", "secret:model"])
+        self.assertIn("create it as docs/SETUP.md describes", failures[0]["fix"])
+        calls = [json.loads(line) for line in (self.root / "kubectl.log").read_text().splitlines()]
+        self.assertEqual([args[:5] for args in calls], [
+            ["-n", "ax-system", "get", "secret", "orbi-demo-github"],
+            ["-n", "ax-system", "get", "secret", "orbi-demo-model"],
+        ])
+        self.assertFalse(self.desired.exists())
+        self.assertEqual(self.status()["desired"], "not-enabled")
+
+    def test_missing_build_tool_has_a_fix(self):
+        for name in ("git", "go"):
+            with self.subTest(tool=name):
+                tool = self.tools / name
+                hidden = tool.rename(tool.with_suffix(".hidden"))
+                try:
+                    failure = self.command("enable", "demo", code=1)["checks"][-1]
+                    self.assertIn(f"{name} not found", failure["detail"])
+                    self.assertIn("install", failure["fix"])
+                    self.assertFalse(self.desired.exists())
+                    self.assert_no_install_commands()
+                finally:
+                    hidden.rename(tool)
+
+    def test_no_install_keeps_the_plain_enable(self):
+        self.deployment.write_text(CONFIG + "\n[ax]\nlocal = true\n")
+        self.command("enable", "demo", "--no-install")
+        self.assert_no_install_commands()
+        self.assertFalse(self.ax_bin.exists())
+        self.assertEqual(json.loads(self.desired.read_text())["mode"], "enabled")
+
+    def test_local_key_is_not_rendered(self):
+        def render():
+            proc = self.process("render", "-c", str(self.deployment))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return proc.stdout
+
+        default = render()
+        self.deployment.write_text(CONFIG + "\n[ax]\nlocal = true\n")
+        self.assertEqual(render(), default)
+        self.deployment.write_text(CONFIG + '\n[ax]\nlocal = "true"\n')
+        proc = self.process("render", "-c", str(self.deployment))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("ax.local must be a boolean", proc.stdout)
+
+    def test_watch_never_installs(self):
+        self.deployment.write_text(CONFIG + "\n[ax]\nlocal = true\n")
+        self.command("enable", "demo", "--no-install")
+        self.command("watch", "--once")
+        self.assertEqual(self.status()["watch"]["phase"], "waiting")
+        self.assert_no_install_commands()
+
+    def test_second_enable_does_not_rebuild(self):
+        self.command("enable", "demo")
+        self.command("enable", "demo")
+        calls = (self.root / "go.log").read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.status()["desired"], "enabled")
+
+    def test_build_image_requires_the_owner_to_update_the_digest(self):
+        ref = "localhost:5001/ax-orbi@sha256:" + "b" * 64
+        self.program("docker", f'''import json, os, sys
+args = sys.argv[1:]
+with open(os.path.join(os.environ["HOME"], "docker.log"), "a") as log:
+    print(args[0], file=log)
+if args[0] == "image":
+    assert args[1:4] == ["inspect", "--format", "{{{{json .RepoDigests}}}}"], args
+    print(json.dumps([{ref!r}]))
+else:
+    print("fake docker " + args[0])
+''')
+        proc = self.process("enable", "demo", "--build-image")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn(f'[image]\nref = "{ref}"', proc.stdout)
+        self.assertEqual(self.deployment.read_text(), CONFIG)
+        self.assertFalse(self.desired.exists())
+        self.assert_no_install_commands()
+        self.assertEqual((self.root / "docker.log").read_text().splitlines(), ["build", "push", "image"])
+
+        updated = CONFIG.replace("a" * 64, "b" * 64)
+        self.deployment.write_text(updated)
+        proc = self.process("enable", "demo", "--build-image", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["ref"], ref)
+        self.assertIn("fake docker push", proc.stderr)
+        self.assertEqual(self.deployment.read_text(), updated)
+        self.assertEqual(self.status()["desired"], "enabled")
+
+
 class WatchTests(FleetTestCase):
     def deployment(self, name="demo", failing=False):
         sb = Sandbox(self, with_config=False)
@@ -63,7 +319,7 @@ class WatchTests(FleetTestCase):
         sb.ax_env = "#!/bin/sh\n" + exports
         self.wrap_ax(sb, "exit 1\n" if failing else "")
         self.config(self.fleet / f"{name}.toml", name, wrapper)
-        self.command("enable", name)
+        self.command("enable", "--no-install", name)
         self.addCleanup(self.fake_ax, sb, "suspend", "task", f"orbi-{name}")
         self.addCleanup(self.wrap_ax, sb)  # Restore the fake even after a failure injection.
         return sb
@@ -471,7 +727,7 @@ class FleetTests(FleetTestCase):
         self.assertEqual(self.status(), {"name": "demo", "repository": "example/demo",
                                          "configPath": str(config), "desired": "not-enabled",
                                          "reason": None, "changedAt": None})
-        self.command("enable", "demo")
+        self.command("enable", "--no-install", "demo")
         self.assertEqual(self.status()["desired"], "enabled")
         self.command("pause", "demo", "--reason", "x")
         paused = self.status()
@@ -485,7 +741,7 @@ class FleetTests(FleetTestCase):
 
     def test_pause_survives_a_new_process(self):
         self.config(self.fleet / "demo.toml")
-        self.command("enable", "demo")
+        self.command("enable", "--no-install", "demo")
         self.command("pause", "demo", "--reason", "maintenance")
         before = self.desired.read_bytes()
         # Every call launches bin/ax-orbi again, with no in-process state.
@@ -500,47 +756,47 @@ class FleetTests(FleetTestCase):
 
     def test_enable_by_config_path_links_the_file(self):
         config = self.config(self.root / "external.toml")
-        self.command("enable", "--config", config.name)
+        self.command("enable", "--no-install", "--config", config.name)
         link = self.fleet / "demo.toml"
         self.assertTrue(link.is_symlink())
         self.assertEqual(link.readlink(), config)
         self.assertEqual(self.status()["desired"], "enabled")
-        self.command("enable", "--config", config.name)  # reuse the same registration
+        self.command("enable", "--no-install", "--config", config.name)  # reuse the same registration
         before = self.desired.read_bytes()
         other = self.config(self.root / "different.toml")
-        self.command("enable", "--config", str(other), code=2)
+        self.command("enable", "--no-install", "--config", str(other), code=2)
         self.assertEqual(link.readlink(), config)
         self.assertEqual(self.desired.read_bytes(), before)
 
     def test_unknown_or_invalid_names_are_refused(self):
-        for command in ("enable", "pause", "resume"):
-            self.command(command, "unknown", code=2)
+        for command in (("enable", "--no-install"), ("pause",), ("resume",)):
+            self.command(*command, "unknown", code=2)
         self.assertEqual(self.command("status", "unknown", code=2)["deployments"], [])
-        proc = self.process("enable", "unknown")
+        proc = self.process("enable", "--no-install", "unknown")
         self.assertIn("enable --config", proc.stdout)  # tell the operator how to register it
 
         config = self.config(self.fleet / "renamed.toml", "invalid")
         config.write_text(config.read_text().replace("[image]", "[not-image]"))
-        self.command("enable", "invalid", code=2)
-        self.command("enable", "--config", str(config), code=2)
+        self.command("enable", "--no-install", "invalid", code=2)
+        self.command("enable", "--no-install", "--config", str(config), code=2)
         self.assertIn("image.ref", self.status("invalid")["configError"])
         self.assertFalse(self.home.exists())
 
     def test_duplicate_names_are_reported_not_acted_on(self):
         self.config(self.fleet / "one.toml")
-        self.command("enable", "demo")
+        self.command("enable", "--no-install", "demo")
         before = self.desired.read_bytes()
         self.config(self.fleet / "two.toml")
         deployments = self.command("status")["deployments"]
         self.assertEqual([entry["name"] for entry in deployments], ["demo", "demo"])
         self.assertTrue(all("duplicate" in entry["configError"] for entry in deployments))
-        for command in ("enable", "pause", "resume"):
-            self.command(command, "demo", code=2)
+        for command in (("enable", "--no-install"), ("pause",), ("resume",)):
+            self.command(*command, "demo", code=2)
         self.assertEqual(self.desired.read_bytes(), before)
 
     def test_unreadable_fleet_links_do_not_hide_valid_configs(self):
         self.config(self.fleet / "demo.toml")
-        self.command("enable", "demo")
+        self.command("enable", "--no-install", "demo")
         pipe = self.root / "pipe"
         os.mkfifo(pipe)
         missing = self.fleet / "missing.toml"
@@ -552,7 +808,7 @@ class FleetTests(FleetTestCase):
         self.assertEqual(entries[str(self.fleet / "demo.toml")]["desired"], "enabled")
         self.assertIn("configError", entries[str(missing)])
         self.assertIn("regular file", entries[str(blocked)]["configError"])
-        self.command("enable", "--config", str(pipe), code=2)
+        self.command("enable", "--no-install", "--config", str(pipe), code=2)
 
     def test_status_runs_no_ax_command(self):
         self.config(self.fleet / "demo.toml")
@@ -569,7 +825,7 @@ class FleetTests(FleetTestCase):
         alternate = self.root / "other-fleet"
         config = self.config(alternate / "demo.toml")
         self.assertEqual(self.command("status")["deployments"], [])
-        self.command("enable", "demo", "--fleet", str(alternate))
+        self.command("enable", "--no-install", "demo", "--fleet", str(alternate))
         entry, = self.command("status", "--fleet", str(alternate))["deployments"]
         self.assertEqual(entry["configPath"], str(config))
         self.assertEqual(entry["desired"], "enabled")
@@ -610,7 +866,7 @@ class FleetTests(FleetTestCase):
         def stop(*args, code=0):
             return self.command("stop", "--config", str(config), *args, code=code)
 
-        self.command("enable", "demo")
+        self.command("enable", "--no-install", "demo")
         enabled = self.desired.read_bytes()
         stop("--delete", code=2)
         self.assertEqual(self.desired.read_bytes(), enabled)

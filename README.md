@@ -45,7 +45,7 @@ Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `--json`
 | `inspect` | Reports sandbox health, recent runs and their evidence. |
 | `stop` | Pauses an enabled deployment and checkpoints the sandbox, keeping state by default. |
 | `recover` | Resumes a checkpointed sandbox and reports interrupted runs. |
-| `enable NAME` or `enable --config PATH` | Enables a fleet deployment; `--config` also registers the file in the fleet. |
+| `enable NAME` or `enable --config PATH` | Installs the pinned AX CLI if needed (only for the default `ax`), starts a local cluster only if AX is unreachable and `[ax] local = true`, and enables the deployment after host checks pass. `--config` also registers the file. `--no-install` skips host preparation and checks. `--build-image` builds and pushes the task image first; if the digest differs, update `image.ref` yourself and retry. |
 | `pause NAME [--reason TEXT]` | Records a pause without changing the AX sandbox. |
 | `resume NAME` | Re-enables a paused deployment without changing the AX sandbox. |
 | `status [NAME]` | Lists fleet deployments, their recorded modes and watch phase, detail and age without contacting AX. |
