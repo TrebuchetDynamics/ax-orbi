@@ -81,7 +81,7 @@ Run this in Bash. If the installer downloaded `kubectl`, add `$HOME/.ax/bin` to 
 
 ## 5. Check, prepare, run and inspect
 
-**Not yet verified on a live cluster.** Run each command from the ax-orbi checkout. Continue only after each succeeds. If reusing a deployment name, inspect first: both `prepare` and `run` can resume a suspended task, and queued requests can execute on resume.
+**Not yet verified on a live cluster.** These are manual steps. To let watch manage the sandbox and run ticks instead, skip to [Unattended operation](#unattended-operation). For manual use, run each command from the ax-orbi checkout and continue only after each succeeds. If reusing a deployment name, inspect first: both `prepare` and `run` can resume a suspended task, and queued requests can execute on resume.
 
 ```bash
 bin/ax-orbi check --json
@@ -107,7 +107,7 @@ bin/ax-orbi recover --json
 
 ## Unattended operation
 
-**Demonstrated offline; not yet qualified on live AX.** Follow the prerequisites and configure the pinned image and Secrets before enabling work. Use one active deployment per repository. From the ax-orbi checkout, register the config (whose `name` is `demo` in this example) and check what watch sees:
+**Demonstrated offline; not yet qualified on live AX.** Set up AX, the pinned image and Secrets as above. You don't need to prepare a sandbox or request a tick manually. Use one active deployment per repository. From the ax-orbi checkout, register the config (whose `name` is `demo` in this example) and check what watch sees:
 
 ```bash
 timeout -s INT 3h bin/ax-orbi enable --config ./ax-orbi.toml

@@ -79,6 +79,11 @@ class UnattendedTests(FleetTestCase):
     def requested_ids(self, sb):
         return [args[-1] for args in self.ax_calls(sb) if "request-tick" in args]
 
+    def assert_requested_ticks(self, sb, *expected):
+        # A status snapshot can straddle launch. Watch may resend the pending
+        # ID, but the agent must not execute it twice or receive a new ID early.
+        self.assertEqual(list(dict.fromkeys(self.requested_ids(sb))), list(expected))
+
     def test_pause_survives_service_restart(self):
         sb, _ = self.enable()
         first = self.completed_tick()["lastTick"]
@@ -144,7 +149,7 @@ class UnattendedTests(FleetTestCase):
         self.make_due()
         second = self.completed_tick(after=first)["lastTick"]["id"]
         self.assertEqual(json.loads(old_run.read_text()), kept)
-        self.assertEqual(self.requested_ids(sb), [first, second])
+        self.assert_requested_ticks(sb, first, second)
         for tick_id in (first, second):
             log = (sb.state / "runs" / tick_id / "tick.log").read_text()
             self.assertEqual(log.count("fake orbi tick:"), 1, log)
@@ -158,17 +163,19 @@ class UnattendedTests(FleetTestCase):
                   "print(json.dumps(data), file=open(sys.argv[1], 'a'))")
         argv = json.dumps(["python3", "-c", notify, str(notices)])
         sb, _ = self.enable(settings=f"[watch]\nnotify_command = {argv}\n")
-        last = self.completed_tick()["lastTick"]["id"]
+        ticks = [self.completed_tick()["lastTick"]["id"]]
         sb.set_mode("fail")
         for attempt, delay in enumerate((60, 300, 900, 1800), 1):
             self.make_due()
-            state = self.completed_tick("failed", after=last)
-            last = state["lastTick"]["id"]
+            state = self.completed_tick("failed", after=ticks[-1])
+            ticks.append(state["lastTick"]["id"])
             self.assertEqual((state["cause"], state["attempts"]), ("tick:failed", attempt), state)
             wait = datetime.fromisoformat(state["nextActionAt"]) - datetime.fromisoformat(state["at"])
             self.assertAlmostEqual(wait.total_seconds(), delay, delta=1)
-            self.watch_once()  # Not due: neither another tick nor another question.
-            self.assertEqual(len(self.requested_ids(sb)), attempt + 1)
+            requests = self.requested_ids(sb)
+            self.assert_requested_ticks(sb, *ticks)
+            self.watch_once()  # Not due: neither another request nor another question.
+            self.assertEqual(self.requested_ids(sb), requests)
             self.assertEqual(self.status()["watch"]["attempts"], attempt)
             if attempt < 3:
                 self.assertEqual(state["phase"], "repairing", state)
@@ -184,11 +191,12 @@ class UnattendedTests(FleetTestCase):
                 self.assertIsNotNone(question["notifiedAt"])
             else:
                 self.assertEqual(state["question"], question)
-        self.assertIn("runner failed: simulated", (sb.state / "runs" / last / "tick.log").read_text())
+            self.assertIn("runner failed: simulated", (sb.state / "runs" / ticks[-1] / "tick.log").read_text())
 
         sb.set_mode("ok")
         self.make_due()
-        recovered = self.completed_tick(after=last)
+        recovered = self.completed_tick(after=ticks[-1])
+        self.assert_requested_ticks(sb, *ticks, recovered["lastTick"]["id"])
         self.assertEqual((recovered["phase"], recovered["cause"], recovered["attempts"]), ("idle", None, 0))
         self.assertIsNone(recovered["question"])
         notice, = map(json.loads, notices.read_text().splitlines())
@@ -218,7 +226,7 @@ class UnattendedTests(FleetTestCase):
         self.assertEqual(fleet["blocked"]["phase"], "needs-owner")
         self.assertEqual(fleet["demo"]["lastTick"]["id"], second)
         self.assertEqual([args[0] for args in self.ax_calls(blocked) if args[0] != "get"], ["apply"])
-        self.assertEqual(self.requested_ids(working), [first, second])
+        self.assert_requested_ticks(working, first, second)
         self.assertEqual(working.ticks(), 2)
 
 
