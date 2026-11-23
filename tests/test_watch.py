@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -120,6 +121,49 @@ class WatchTests(FleetTestCase):
         self.assertEqual(self.desired.read_bytes(), before)
         self.assertFalse((sb.tmp / "ax-calls.jsonl").exists())
 
+    def test_pause_during_ax_lookup_prevents_a_change(self):
+        sb = self.deployment()
+        lookup = self.root / "in-get"
+        release = self.root / "release-get"
+        self.wrap_ax(sb, f'if [ "$3" = get ]; then\n  : > {shlex.quote(str(lookup))}\n'
+                     f'  timeout --foreground 5s sh -c \'while [ ! -f "$1" ]; do sleep 0.05; done\' sh '
+                     f'{shlex.quote(str(release))} || exit "$?"\nfi\n')
+        proc = subprocess.Popen([sys.executable, str(CLI), "watch", "--once"], env=self.env,
+                                cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            wait_until(lookup.exists, timeout=4, what="watch to start the AX lookup")
+            self.command("pause", "demo")
+            release.touch()
+            out, err = proc.communicate(timeout=5)
+            self.assertEqual(proc.returncode, 0, out + err)
+        finally:
+            release.touch()
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate(timeout=5)
+        state = self.watch_state()
+        self.assertEqual((state["desired"], state["phase"]), ("paused", "paused"))
+        self.assertEqual(self.calls(sb), [["get", "tasks"]])
+
+    def test_ax_timeout_stops_wrapper_children(self):
+        sb = self.deployment()
+        worker_pid = self.root / "worker.pid"
+        self.wrap_ax(sb, f'if [ "$3" = apply ]; then\n  sleep 4 &\n  echo "$!" > '
+                     f'{shlex.quote(str(worker_pid))}\n  wait\nfi\n')
+        ax = cli.Ax(cli.load_config(self.fleet / "demo.toml"), start_new_session=True)
+        with patch.dict(os.environ, self.env):
+            code, _, error = ax.run("apply", "-f", "-", stdin="", timeout=0.5)
+        self.assertEqual(code, 124, error)
+        worker = Path("/proc") / worker_pid.read_text().strip() / "stat"
+
+        def stopped():
+            try:
+                return worker.read_text().rsplit(") ", 1)[1].startswith("Z ")
+            except FileNotFoundError:
+                return True
+
+        wait_until(stopped, timeout=1, what="the timed out AX wrapper's worker to exit")
+
     def test_enabled_deployment_reaches_a_tick(self):
         sb = self.deployment()
         phases = self.reach_tick()
@@ -199,6 +243,28 @@ class WatchTests(FleetTestCase):
         self.assertEqual(self.requests(sb), [run_id])
         sb.wait_status(run_id, "succeeded")
         self.assertEqual(sb.ticks(), 1)
+
+    def test_pending_tick_is_synced_before_retrying_a_failed_write(self):
+        sb = self.deployment()
+        self.make_ready(sb)
+        sync = os.fsync
+
+        def fail_directory_sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("simulated watch state directory sync failure")
+            sync(fd)
+
+        # The rename was visible, but the pending id was not yet durable.
+        with (patch.dict(os.environ, self.env), patch.object(cli.os, "fsync", fail_directory_sync),
+              patch("sys.stderr")):
+            self.assertEqual(cli.main(["watch", "--once"]), 0)
+            pending = self.watch_state()["pendingTick"]
+            self.assertEqual(cli.main(["watch", "--once"]), 0)
+            self.assertEqual(self.watch_state()["pendingTick"], pending)
+        self.assertEqual(self.requests(sb), [])
+        self.watch_once()
+        self.assertEqual(self.requests(sb), [pending["id"]])
+        sb.wait_status(pending["id"], "succeeded")
 
     def test_one_failing_deployment_does_not_stop_the_other(self):
         broken = self.deployment("broken", failing=True)
@@ -359,6 +425,12 @@ class WatchTests(FleetTestCase):
         config.write_text(valid)
         self.watch_once()
         self.assertEqual(self.watch_state()["notifyCommand"], ["never-run-this"])
+        config.write_text(valid.replace('["never-run-this"]', "2026-11-23"))
+        self.watch_once()
+        self.assertEqual(self.watch_state()["phase"], "config-error")
+        self.assertIn("watch.notify_command", self.watch_state()["detail"])
+        self.assertEqual(self.watch_state()["notifyCommand"], ["never-run-this"])
+
         config.write_text(valid + "tick_interval = 10\n")
         (self.fleet / "bad.toml").write_text("not valid TOML")
         self.config(self.fleet / "unregistered.toml", "unregistered")
@@ -371,6 +443,18 @@ class WatchTests(FleetTestCase):
         self.assertNotIn("watch", entries["unregistered"])
         self.assertEqual(list(self.home.glob("deployments/*/watch.json")), [self.watch_path()])
         self.assertFalse((sb.tmp / "ax-calls.jsonl").exists())
+
+    def test_fixed_config_without_a_record_is_not_watched(self):
+        config = self.config(self.fleet / "demo.toml")
+        original = config.read_text()
+        config.write_text(original + "[watch]\ntick_interval = 10\n")
+        self.watch_once()
+        self.assertEqual(self.status()["watch"]["phase"], "config-error")
+        config.write_text(original)
+        self.watch_once()
+        entry = self.status()
+        self.assertEqual(entry["desired"], "not-enabled")
+        self.assertNotIn("watch", entry)
 
     def test_print_unit_names_this_checkout(self):
         proc = self.process("watch", "--print-unit")

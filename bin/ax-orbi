@@ -152,6 +152,11 @@ def load_config(path: Path) -> dict:
         interval = watch.setdefault("tick_interval", 300)
         if type(interval) is not int or interval < 60:
             errors.append("watch.tick_interval must be an integer of at least 60 seconds")
+        if "notify_command" in watch:
+            try:
+                json.dumps(watch["notify_command"], allow_nan=False)
+            except (TypeError, ValueError):
+                errors.append("watch.notify_command must be a value that can be saved as JSON")
 
     if errors:
         raise ConfigError(f"{path}:\n  - " + "\n  - ".join(errors))
@@ -292,14 +297,29 @@ class Ax:
             self.base += ["--context", cfg["ax"]["context"]]
 
     def run(self, *args: str, stdin: str | None = None, timeout: float = 900):
+        argv = self.base + list(args)
         try:
-            proc = subprocess.run(self.base + list(args), input=stdin, text=True,
-                                  capture_output=True, timeout=timeout, start_new_session=self.start_new_session)
+            if not self.start_new_session:
+                proc = subprocess.run(argv, input=stdin, text=True, capture_output=True, timeout=timeout)
+                return proc.returncode, proc.stdout, proc.stderr
+            with subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                  start_new_session=True) as proc:
+                try:
+                    out, err = proc.communicate(stdin, timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    # A configured AX wrapper can be waiting on the actual CLI.
+                    # Kill the group so it cannot still act after watch moves on.
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    raise
+                return proc.returncode, out, err
         except FileNotFoundError:
             return 127, "", f"{self.base[0]}: not found on PATH"
         except subprocess.TimeoutExpired:
             return 124, "", f"ax {' '.join(args)}: timed out after {timeout}s"
-        return proc.returncode, proc.stdout, proc.stderr
 
     def task_state(self, task: str, timeout: float = 60) -> str | None:
         """An AX label, empty if absent, or None if the lookup failed."""
@@ -930,7 +950,10 @@ def cmd_status(args, report: Report) -> int:
                 if record is not None:
                     entry.update(desired=record["mode"], reason=record.get("reason"), changedAt=record.get("changedAt"))
                 watch = read_state(path.with_name("watch.json"))
-                if watch is not None:
+                # A fixed config that has never been enabled is no longer watched.
+                stale_config_error = (watch is not None and watch.get("phase") == "config-error"
+                                      and record is None and "configError" not in entry)
+                if watch is not None and not stale_config_error:
                     entry["watch"] = watch
                     try:
                         at = datetime.fromisoformat(watch.get("at"))
@@ -962,8 +985,14 @@ def cmd_status(args, report: Report) -> int:
     return report.finish(code, deployments=deployments)
 
 
-def watch_step(cfg: dict, state: dict, path: Path) -> tuple[str, str]:
+def watch_step(cfg: dict, state: dict, path: Path) -> tuple[str, str] | None:
     """Observe once, then make at most one change within a 120-second AX budget."""
+    def still_enabled() -> bool:
+        # An operator can pause (including via stop) while the observation is in flight.
+        record = read_desired(path.with_name("desired.json"))
+        state["desired"] = record["mode"] if record is not None else None
+        return state["desired"] == "enabled"
+
     # A foreground Ctrl-C should reach watch, not cancel its current AX command.
     ax, task = Ax(cfg, start_new_session=True), names(cfg)["task"]
     observed = ax.task_state(task, timeout=40)
@@ -971,11 +1000,14 @@ def watch_step(cfg: dict, state: dict, path: Path) -> tuple[str, str]:
     kind = TASK_CLASSES.get(observed, "unrecognised")
     if kind in ("missing", "checkpointed"):
         if kind == "missing":
-            code, out, err = ax.run("apply", "-f", "-", stdin=render(cfg), timeout=80)
+            args, stdin = ("apply", "-f", "-"), render(cfg)
             phase, detail = "preparing", "Creating the sandbox"
         else:
-            code, out, err = ax.run("resume", "task", task, timeout=80)
+            args, stdin = ("resume", "task", task), None
             phase, detail = "resuming", "Restoring the sandbox"
+        if not still_enabled():
+            return None
+        code, out, err = ax.run(*args, stdin=stdin, timeout=80)
         if code != 0:
             raise RuntimeError(f"{detail} failed: {(err or out).strip() or f'AX exited {code}'}")
         return phase, detail
@@ -1021,11 +1053,15 @@ def watch_step(cfg: dict, state: dict, path: Path) -> tuple[str, str]:
         if now < next_action:
             return "idle", f"Next tick at {next_action:%H:%M UTC}"
 
+    if not still_enabled():
+        return None
     if pending is None:
         pending = {"id": f"watch-{now:%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}", "requestedAt": now.isoformat()}
         state["pendingTick"] = pending
-        state.update(at=now.isoformat(), phase="ticking", detail=f"Requesting Orbi tick {pending['id']}")
-        write_state(path, state)  # Persist the id before AX can deliver it to the agent.
+    state.update(at=now.isoformat(), phase="ticking", detail=f"Requesting Orbi tick {pending['id']}")
+    write_state(path, state)  # Make the id durable even if a prior write failed after rename.
+    if not still_enabled():
+        return None
     answer, err = ax.agent(task, "request-tick", "--id", pending["id"], timeout=40)
     if not answer:
         raise RuntimeError(f"Could not request Orbi tick {pending['id']}: {err}")
@@ -1054,10 +1090,10 @@ def watch_deployment(entry: dict) -> None:
             cfg = entry["config"]
             if "notify_command" in cfg["watch"]:
                 state["notifyCommand"] = cfg["watch"]["notify_command"]
-            if record["mode"] == "paused":
-                phase, detail = "paused", "Deployment is paused"
-            else:
-                phase, detail = watch_step(cfg, state, path)
+            step = watch_step(cfg, state, path) if record["mode"] == "enabled" else None
+            if state["desired"] is None:
+                return
+            phase, detail = step if step is not None else ("paused", "Deployment is paused")
     except Exception as exc:
         phase, detail = "blocked", str(exc) or type(exc).__name__
     state.update(version=1, deployment=name, at=datetime.now(timezone.utc).isoformat(),
