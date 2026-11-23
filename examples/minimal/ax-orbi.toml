@@ -37,6 +37,12 @@ prefix = "Bearer "                   # Prefix AX adds; the trailing space matter
 [network]
 allow = [] # Additional HTTPS DNS names; GitHub and the model host are already included.
 
+# Optional repository-owned dependency recipe. Package hosts must be in [network] allow.
+# [project]
+# setup = "scripts/ax-orbi-setup.sh"
+# check = "scripts/ax-orbi-check.sh" # Optional; exit 0 means ready. Without it, setup runs once per start.
+# setup_timeout = 1800               # Seconds (60 to 7200).
+
 [ax]
 atespace = "default" # AX atespace where the manifests are applied.
 bin = "ax"          # AX CLI on PATH, or an explicit path to the binary.
