@@ -33,7 +33,7 @@ Import or copy the entire [`skills/ax-orbi/`](skills/ax-orbi/) directory into yo
 
 ## CLI
 
-Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `-c` / `--config` (default `./ax-orbi.toml`) and `--json`.
+Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `--json`. The fleet commands (`enable`, `pause`, `resume`, `status`) accept `--fleet DIR` to override `$AX_ORBI_FLEET` or the default deployment directory (`$XDG_CONFIG_HOME/ax-orbi/deployments`, normally `~/.config/ax-orbi/deployments`). Other commands accept `-c` / `--config` (default `./ax-orbi.toml`).
 
 | Command | What it does |
 | --- | --- |
@@ -43,8 +43,12 @@ Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `-c` / `
 | `prepare` | Creates, starts or resumes the sandbox without requesting a new tick. |
 | `run` | Requests one Orbi tick and waits for the result by default. |
 | `inspect` | Reports sandbox health, recent runs and their evidence. |
-| `stop` | Checkpoints the sandbox, keeping state by default. |
+| `stop` | Pauses an enabled deployment and checkpoints the sandbox, keeping state by default. |
 | `recover` | Resumes a checkpointed sandbox and reports interrupted runs. |
+| `enable NAME` or `enable --config PATH` | Enables a fleet deployment; `--config` also registers the file in the fleet. |
+| `pause NAME [--reason TEXT]` | Records a pause without changing the AX sandbox. |
+| `resume NAME` | Re-enables a paused deployment without changing the AX sandbox. |
+| `status [NAME]` | Lists fleet deployments and their recorded modes without contacting AX. |
 
 Exit codes: `0` command succeeded (possibly with warnings), `1` operation, check or tick failed, `2` bad usage or configuration, `3` interrupted, pending or unknown outcome. `check --json` lists warnings in `unverified`; it checks digest syntax (`image-pinned`), not the running image's `image-pins`. See [Interpreting results](docs/SETUP.md#interpreting-results) for the `taskState` classes, pin verification and what `executionUnknown` means after a forced stop.
 
