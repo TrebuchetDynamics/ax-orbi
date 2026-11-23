@@ -117,6 +117,22 @@ class FleetTests(unittest.TestCase):
             self.command(command, "demo", code=2)
         self.assertEqual(self.desired.read_bytes(), before)
 
+    def test_unreadable_fleet_links_do_not_hide_valid_configs(self):
+        self.config(self.fleet / "demo.toml")
+        self.command("enable", "demo")
+        pipe = self.root / "pipe"
+        os.mkfifo(pipe)
+        missing = self.fleet / "missing.toml"
+        missing.symlink_to(self.root / "missing")
+        blocked = self.fleet / "pipe.toml"
+        blocked.symlink_to(pipe)
+
+        entries = {entry["configPath"]: entry for entry in self.command("status")["deployments"]}
+        self.assertEqual(entries[str(self.fleet / "demo.toml")]["desired"], "enabled")
+        self.assertIn("configError", entries[str(missing)])
+        self.assertIn("regular file", entries[str(blocked)]["configError"])
+        self.command("enable", "--config", str(pipe), code=2)
+
     def test_status_runs_no_ax_command(self):
         self.config(self.fleet / "demo.toml")
         self.assertEqual(self.status()["desired"], "not-enabled")

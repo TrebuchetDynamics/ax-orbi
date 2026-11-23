@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -781,7 +782,11 @@ def write_desired(path: Path, mode: str, reason: str) -> None:
 
 def load_fleet_config(path: Path) -> dict:
     try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise ConfigError(f"{path}: expected a regular file for the deployment config")
         return load_config(path)
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc.strerror}") from None
     except (AttributeError, TypeError, ValueError) as exc:
         # Invalid TOML field types can fail before load_config collects its errors.
         raise ConfigError(f"{path}: invalid deployment config: {exc}") from None
@@ -794,7 +799,7 @@ def fleet_entries(fleet: Path) -> list[dict]:
         return []
     entries = []
     for path in paths:
-        if not path.match("*.toml") or not (path.is_file() or path.is_symlink()):
+        if not path.match("*.toml") or (not path.is_symlink() and path.is_dir()):
             continue
         entry = {"configPath": str(path)}
         try:
@@ -803,7 +808,7 @@ def fleet_entries(fleet: Path) -> list[dict]:
             entry["configError"] = str(exc)
             # Preserve the declared identity even when another field is invalid.
             try:
-                cfg = tomllib.loads(path.read_text(encoding="utf-8"))
+                cfg = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
             except (OSError, ValueError):
                 cfg = {}
         name, repository = cfg.get("name"), cfg.get("repository")
