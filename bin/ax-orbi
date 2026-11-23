@@ -133,6 +133,20 @@ def load_config(path: Path) -> dict:
     if not isinstance(orbi, dict):
         errors.append("[orbi] must be a table of Orbi settings")
 
+    if "project" in cfg:
+        project = cfg["project"]
+        if not isinstance(project, dict):
+            errors.append("[project] must be a table")
+        else:
+            for key in ("setup", "check"):
+                if key == "setup" or key in project:
+                    value = need(project, key, "project.")
+                    if value and (Path(value).is_absolute() or ".." in Path(value).parts):
+                        errors.append(f"project.{key} must be a path inside the repository")
+            timeout = project.setdefault("setup_timeout", 1800)
+            if type(timeout) is not int or not 60 <= timeout <= 7200:
+                errors.append("project.setup_timeout must be an integer from 60 to 7200 seconds")
+
     if errors:
         raise ConfigError(f"{path}:\n  - " + "\n  - ".join(errors))
     cfg["repository"], cfg["image"], cfg["credentials"] = repo, image, creds
@@ -154,6 +168,8 @@ def agent_config(cfg: dict) -> dict:
         out["pi"] = {k: model[k] for k in
                      ("provider", "model", "base_url", "api", "context_window", "max_tokens")
                      if k in model}
+    if "project" in cfg:
+        out["project"] = cfg["project"]
     return out
 
 

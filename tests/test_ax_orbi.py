@@ -8,6 +8,7 @@ as separate processes.
     python3 -m unittest discover -s tests -v
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import suppress
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
@@ -123,6 +125,17 @@ class Sandbox:
 
     def set_mode(self, mode: str):
         self.mode_file.write_text(mode)
+
+    def configure_project(self, *, check=True):
+        (self.repo / "setup.sh").write_text('set -eu\n: > dependency\nprintf "setup\\n" >> setup-count\n')
+        project = {"setup": "setup.sh", "setup_timeout": 60}
+        if check:
+            script = self.repo / "check.sh"
+            script.write_text('#!/bin/sh\ntest -f dependency || { echo dependency-missing; exit 1; }\n')
+            script.chmod(0o755)
+            project["check"] = "check.sh"
+        cfg = json.loads(self.env["AX_ORBI_CONFIG"])
+        self.env["AX_ORBI_CONFIG"] = json.dumps({**cfg, "project": project})
 
     def ticks(self) -> int:
         return len(self.tick_log.read_text().splitlines()) if self.tick_log.exists() else 0
@@ -384,6 +397,153 @@ class AgentTests(unittest.TestCase):
         self.assertIn("not prepared", run["detail"])
         self.assertEqual(sb.ticks(), 0)
 
+    def test_project_setup_runs_when_check_fails(self):
+        sb = Sandbox(self)
+        sb.configure_project()
+        sb.serve()
+        sb.wait_ready()
+        prep = sb.status()["prepare"]
+        checks = {c["name"]: c for c in prep["checks"]}
+        self.assertIn("project:ready", checks)
+        self.assertTrue(checks["project:ready"]["ok"], prep)
+        self.assertEqual(prep["project"], {
+            "ranSetup": True,
+            "setupSha256": hashlib.sha256((sb.repo / "setup.sh").read_bytes()).hexdigest(),
+        })
+        sb.request("t-project")
+        self.assertEqual(sb.wait_status("t-project", "succeeded", "failed")["status"], "succeeded")
+        self.assertEqual((sb.repo / "setup-count").read_text().splitlines(), ["setup"])
+
+    def test_ready_project_does_not_run_setup(self):
+        sb = Sandbox(self)
+        sb.configure_project()
+        # An executable check with a non-sh shebang verifies direct execution.
+        (sb.repo / "check.sh").write_text(
+            '#!/usr/bin/env python3\nimport os, pathlib, sys\n'
+            'state = pathlib.Path(os.environ["AX_ORBI_STATE_DIR"])\n'
+            'assert os.environ["HOME"] == str(state / "home")\n'
+            'assert os.environ["ORBI_CONFIG"] == str(state / "orbi.toml")\n'
+            'assert "AX_ORBI_CONFIG" not in os.environ\n'
+            'sys.exit(not pathlib.Path("dependency").is_file())\n')
+        code, out = sb.agent("prepare")
+        self.assertEqual(code, 1, out)
+        self.assertFalse(json.loads(out)["project"]["ranSetup"])
+        self.assertFalse((sb.state / "project-setup.log").exists())
+        (sb.repo / "dependency").touch()
+        code, out = sb.agent("prepare")
+        self.assertEqual(code, 0, out)
+        self.assertFalse((sb.state / "prepare.json").exists())
+        sb.serve()
+        sb.wait_ready()
+        prep = sb.status()["prepare"]
+        self.assertTrue(prep["ok"], prep)
+        self.assertFalse(prep["project"]["ranSetup"])
+        self.assertFalse((sb.repo / "setup-count").exists())
+
+    def test_removed_dependency_is_restored_before_next_tick(self):
+        sb = Sandbox(self)
+        sb.configure_project()
+        sb.serve()
+        sb.wait_ready()
+        sb.request("t-first")
+        self.assertEqual(sb.wait_status("t-first", "succeeded", "failed")["status"], "succeeded")
+        (sb.repo / "dependency").unlink()
+        sb.request("t-repaired")
+        self.assertEqual(sb.wait_status("t-repaired", "succeeded", "failed")["status"], "succeeded")
+        self.assertTrue((sb.repo / "dependency").is_file())
+        self.assertEqual((sb.repo / "setup-count").read_text().splitlines(), ["setup", "setup"])
+        self.assertTrue(sb.status()["prepare"]["project"]["ranSetup"])
+        self.assertEqual(sb.ticks(), 2)
+
+    def test_failed_project_setup_refuses_ticks(self):
+        sb = Sandbox(self)
+        sb.configure_project()
+        setup = sb.repo / "setup.sh"
+        setup.write_text("echo old-error; exit 1\n")
+        sb.serve()
+        sb.wait_ready()
+        setup.write_text("echo installing; echo setup-broke >&2; exit 1\n")
+        sb.request("t-blocked")
+        run = sb.wait_status("t-blocked", "failed", "succeeded")
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["detail"], "not started: the environment is not prepared (see prepare.json)")
+        prep = sb.status()["prepare"]
+        ready = next(c for c in prep["checks"] if c["name"] == "project:ready")
+        self.assertFalse(ready["ok"])
+        log = sb.state / "project-setup.log"
+        for evidence in ("exit 1: setup-broke", "check exit 1: dependency-missing", str(log)):
+            self.assertIn(evidence, ready["detail"])
+        self.assertEqual(log.read_text(), "installing\nsetup-broke\n")
+        self.assertEqual(sb.ticks(), 0)
+        sb.configure_project()
+        sb.request("t-retry")
+        self.assertEqual(sb.wait_status("t-retry", "succeeded", "failed")["status"], "succeeded")
+
+    def test_setup_without_check_runs_once_per_start(self):
+        sb = Sandbox(self)
+        sb.configure_project(check=False)
+        code, out = sb.agent("prepare")
+        self.assertEqual(code, 1, out)
+        self.assertFalse((sb.repo / "setup-count").exists())
+        first = sb.serve()
+        sb.wait_ready()
+        for run_id in ("t-first", "t-second"):
+            sb.request(run_id)
+            self.assertEqual(sb.wait_status(run_id, "succeeded", "failed")["status"], "succeeded")
+        prep = sb.status()["prepare"]
+        self.assertFalse(prep["project"]["ranSetup"])
+        cache = sb.state / "project-setup.json"
+        self.assertEqual(json.loads(cache.read_text())["bootId"], prep["bootId"])
+        self.assertEqual((sb.repo / "setup-count").read_text().splitlines(), ["setup"])
+        first.terminate()
+        self.assertEqual(first.wait(timeout=5), 0)
+        sb.serve()
+        sb.wait_ready()
+        self.assertNotEqual(json.loads(cache.read_text())["bootId"], prep["bootId"])
+        self.assertEqual((sb.repo / "setup-count").read_text().splitlines(), ["setup", "setup"])
+
+    def test_stop_during_setup_ends_the_script(self):
+        for at_start, script, sig in ((True, "setup.sh", signal.SIGTERM),
+                                      (False, "setup.sh", signal.SIGTERM),
+                                      (False, "check.sh", signal.SIGINT)):
+            with self.subTest(at_start=at_start, script=script, signal=sig):
+                sb = Sandbox(self)
+                sb.configure_project()
+                if not at_start:
+                    (sb.repo / "dependency").touch()
+                pidfile = sb.repo / "script-pids"
+                # Check both the script and a child in its process group.
+                hanging = ('#!/bin/sh\nsleep 120 &\nchild=$!\n'
+                           'trap \'wait "$child"; exit 0\' TERM\n'
+                           'printf "%s %s\\n" "$$" "$child" > script-pids\nwait "$child"\n')
+                if at_start:
+                    (sb.repo / script).write_text(hanging)
+                proc = sb.serve()
+                if not at_start:
+                    sb.wait_ready()
+                    (sb.repo / "dependency").unlink()
+                    (sb.repo / script).write_text(hanging)
+                sb.request("t-stopped")
+                pids = wait_until(lambda: pidfile.exists() and pidfile.read_text().split(),
+                                  timeout=5, what="project script to start")
+                leader, sleeper = map(int, pids)
+                try:
+                    os.kill(sleeper, 0)
+                    proc.send_signal(sig)
+                    self.assertEqual(proc.wait(timeout=5), 0)
+                    for pid in (leader, sleeper):
+                        with self.assertRaises(ProcessLookupError):
+                            os.kill(pid, 0)
+                finally:
+                    with suppress(ProcessLookupError):
+                        os.killpg(leader, signal.SIGKILL)
+                prep = json.loads((sb.state / "prepare.json").read_text())
+                ready = next(c for c in prep["checks"] if c["name"] == "project:ready")
+                self.assertFalse(ready["ok"])
+                self.assertEqual(ready["detail"], "interrupted by stop")
+                self.assertEqual(sb.run_record("t-stopped")["status"], "queued")
+                self.assertEqual(sb.ticks(), 0)
+
     def test_wrong_origin_fails_prepare(self):
         sb = Sandbox(self)
         subprocess.run(["git", "-C", str(sb.repo), "remote", "set-url", "origin",
@@ -432,6 +592,65 @@ class CliConfigTests(unittest.TestCase):
         path = tmp / "ax-orbi.toml"
         path.write_text(text)
         return path
+
+    def render_config(self, path: Path, *args: str):
+        home, fleet = path.parent / "home", path.parent / "fleet"
+        home.mkdir(exist_ok=True)
+        fleet.mkdir(exist_ok=True)
+        env = {**os.environ, "AX_ORBI_HOME": str(home), "AX_ORBI_FLEET": str(fleet)}
+        return subprocess.run([str(CLI), "render", "-c", str(path), *args], env=env,
+                              capture_output=True, timeout=5)
+
+    def test_project_paths_must_stay_in_the_repository(self):
+        for settings, key in (
+            ("", "setup"), ('setup = ""', "setup"), ('setup = "/setup.sh"', "setup"),
+            ('setup = "scripts/../setup.sh"', "setup"),
+            ('setup = "setup.sh"\ncheck = "../check.sh"', "check"),
+            ('setup = "setup.sh"\ncheck = "/check.sh"', "check"),
+            ('setup = "setup.sh"\ncheck = ""', "check"),
+            *[(f'setup = "setup.sh"\nsetup_timeout = {value}', "setup_timeout")
+              for value in (59, 7201, "true", "60.0")],
+        ):
+            with self.subTest(settings=settings):
+                result = self.render_config(self.write(CONFIG + "\n[project]\n" + settings), "--json")
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn(f"project.{key}", json.loads(result.stdout)["checks"][0]["detail"])
+
+        sb = Sandbox(self)
+        sb.configure_project()
+        script = sb.repo / "setup.sh"
+        outside = sb.tmp / "outside.sh"
+        script.rename(outside)
+        for missing in (False, True):
+            if missing:
+                script.unlink()
+            else:
+                script.symlink_to(outside)
+            code, out = sb.agent("prepare")
+            self.assertEqual(code, 1, out)
+            prep = json.loads(out)
+            failure = next(c for c in prep["checks"] if not c["ok"])
+            self.assertEqual(failure["name"], "project:setup")
+            self.assertIn("inside the repository", failure["fix"])
+
+    def test_project_table_is_optional_in_manifests(self):
+        project = '\n[project]\nsetup = "setup.sh"\ncheck = "check.sh"\nsetup_timeout = 7200\n'
+        path = self.write(CONFIG + project)
+        result = self.render_config(path, "--json")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        task = next(doc for doc in json.loads(result.stdout)["manifests"] if doc["kind"] == "Task")
+        payload = json.loads(next(e["value"] for e in task["spec"]["env"]
+                                  if e["name"] == "AX_ORBI_CONFIG"))
+        self.assertEqual(payload.pop("project"), {
+            "setup": "setup.sh", "check": "check.sh", "setup_timeout": 7200})
+
+        path.write_text(CONFIG)
+        baseline = self.render_config(path)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        # SHA-256 of `ax-orbi render -c` using this CONFIG at 94044bb.
+        self.assertEqual(hashlib.sha256(baseline.stdout).hexdigest(),
+                         "cc9b60322e477940dbb3dc896503af154dd5dab1b45c54167ff7166f21afcc0e")
+        self.assertEqual(cli.agent_config(cli.load_config(path)), payload)
 
     def test_example_config_and_referenced_docs_exist(self):
         cfg = cli.load_config(ROOT / "examples" / "minimal" / "ax-orbi.toml")

@@ -30,12 +30,14 @@ import argparse
 import datetime as dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -219,12 +221,141 @@ def run_quiet(cmd: list[str], env: dict, cwd: str | None = None, timeout: int = 
         return 124, f"{' '.join(cmd)}: timed out after {timeout}s"
 
 
-def prepare(sdir: Path, boot_id: str | None = None) -> dict:
+def signal_group(child: subprocess.Popen, signum: int) -> None:
+    try:
+        os.killpg(child.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def run_project_script(script: Path, repo_dir: Path, env: dict, timeout: int,
+                       output, supervisor: Supervisor | None) -> tuple[int, str]:
+    def stopping() -> bool:
+        return supervisor is not None and supervisor.stopping.is_set()
+
+    if stopping():
+        return -signal.SIGTERM, ""
+    cmd = [str(script)] if os.access(script, os.X_OK) else ["sh", str(script)]
+    try:
+        child = subprocess.Popen(cmd, cwd=repo_dir, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as exc:
+        detail = f"could not start {script}: {exc}"
+        output.write((detail + "\n").encode("utf-8"))
+        return 127, detail
+
+    if supervisor is not None:
+        supervisor.child = child
+    try:
+        # A stop during Popen sets the flag even if the handler hasn't seen
+        # the child yet. Short waits also bound shutdown if it ignores TERM.
+        deadline = time.monotonic() + timeout
+        code = None
+        while not stopping():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                code = child.wait(timeout=min(remaining, 0.2) if supervisor else remaining)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+        if stopping():
+            signal_group(child, signal.SIGTERM)
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            signal_group(child, signal.SIGKILL)
+            child.wait()
+            return -signal.SIGTERM, ""
+        timed_out = code is None
+        if timed_out:
+            signal_group(child, signal.SIGKILL)
+            child.wait()
+            code = 124
+        output.seek(max(0, output.seek(0, os.SEEK_END) - 256 * 1024))
+        lines = output.read().decode("utf-8", "replace").splitlines()
+        last = lines[-1] if lines else ""
+        if timed_out:
+            last = f"timed out after {timeout}s" + (f": {last}" if last else "")
+        return code, last
+    finally:
+        if supervisor is not None:
+            supervisor.child = None
+
+
+def prepare_project(sdir: Path, repo_dir: Path, project: dict, env: dict, boot_id: str | None,
+                    supervisor: Supervisor | None, report: dict, check) -> None:
+    info = report["project"] = {"setupSha256": None, "ranSetup": False}
+    fix = "set project.{} to a script file inside the repository"
+    repo_dir = repo_dir.resolve()
+    paths = {}
+    for key in ("setup", "check"):
+        if key == "check" and key not in project:
+            continue
+        try:
+            path = (repo_dir / project[key]).resolve(strict=True)
+            if not path.is_relative_to(repo_dir) or not path.is_file():
+                raise ValueError("not a file inside the repository")
+            paths[key] = path
+            if key == "setup":
+                info["setupSha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            check("project:setup", False, f"project.{key}: {exc}", fix.format(key))
+            return
+
+    log = sdir / "project-setup.log"
+    cache = sdir / "project-setup.json"
+    check_script = paths.get("check")
+
+    def probe() -> tuple[int, str]:
+        with tempfile.TemporaryFile() as output:
+            return run_project_script(check_script, repo_dir, env, 300, output, supervisor)
+
+    def result(ok: bool, detail: str, fix: str = "") -> None:
+        if supervisor is not None and supervisor.stopping.is_set():
+            check("project:ready", False, "interrupted by stop")
+        else:
+            check("project:ready", ok, detail, fix)
+
+    def describe(label: str, code: int, line: str) -> str:
+        return f"{label} exit {code}" + (f": {line}" if line else "")
+
+    if check_script is not None:
+        code, last = probe()
+        if code == 0 or not boot_id or (supervisor is not None and supervisor.stopping.is_set()):
+            result(code == 0, describe("check", code, last) +
+                   (f"; setup log: {log}" if code else ""),
+                   "fix the check or start the supervisor to run setup")
+            return
+    elif not boot_id:
+        result(False, "setup requires a supervisor start", "start the supervisor to run setup")
+        return
+
+    saved = (read_json(cache) or {}) if check_script is None else {}
+    if saved.get("bootId") == boot_id:
+        code, last = saved["exitCode"], saved["lastLine"]
+    else:
+        info["ranSetup"] = True
+        with log.open("w+b") as output:
+            code, last = run_project_script(paths["setup"], repo_dir, env,
+                                            project.get("setup_timeout", 1800), output, supervisor)
+        if check_script is None:
+            write_json(cache, {"bootId": boot_id, "exitCode": code, "lastLine": last})
+    detail = describe("setup", code, last)
+    if check_script is not None and not (supervisor is not None and supervisor.stopping.is_set()):
+        code, last = probe()
+        detail += "; " + describe("check", code, last)
+    result(code == 0, detail if code == 0 else f"{detail}; see {log}",
+           "fix the project recipe and " + ("retry" if check_script else "restart the supervisor"))
+
+
+def prepare(sdir: Path, boot_id: str | None = None, *, supervisor: Supervisor | None = None) -> dict:
     """Make the environment ready for a tick, without starting one.
 
-    Idempotent: runs at every start. Returns the report; `ok` is False when a
-    tick could not possibly work. Only the supervisor (which passes its boot
-    id) writes prepare.json, so the file always describes a known start.
+    Runs at every start and before each tick. Only the supervisor (which
+    passes its boot id) may run setup or write prepare.json.
     """
     checks: list[dict] = []
 
@@ -274,6 +405,7 @@ def prepare(sdir: Path, boot_id: str | None = None) -> dict:
 
     repo_dir = Path(cfg["repo_dir"])
     code, out = run_quiet(["git", "-C", str(repo_dir), "rev-parse", "HEAD"], env)
+    origin_ok = False
     if check("checkout", code == 0, f"{repo_dir} at {out[:12]}" if code == 0 else out,
              "the Workspace did not clone the repository: check `ax describe workspace`, "
              "the repository URL, and that the gateway allows github.com"):
@@ -289,9 +421,9 @@ def prepare(sdir: Path, boot_id: str | None = None) -> dict:
         code, out = run_quiet(["git", "-C", str(repo_dir), "remote", "get-url", "origin"], env)
         want = f"github.com/{cfg['source_repo']}"
         origin = out.strip().lower().removesuffix("/").removesuffix(".git")
-        check("origin", code == 0 and origin.endswith("/" + want.lower()),
-              out or "no origin remote",
-              f"the checkout's origin must be https://{want}.git")
+        origin_ok = check("origin", code == 0 and origin.endswith("/" + want.lower()),
+                          out or "no origin remote",
+                          f"the checkout's origin must be https://{want}.git")
 
     if env.get("GH_TOKEN"):
         # Route git over HTTPS through gh, Orbi's token-only transport.
@@ -302,6 +434,8 @@ def prepare(sdir: Path, boot_id: str | None = None) -> dict:
         check("git-credentials", False, "GH_TOKEN is not set",
               "set [credentials.github] in the deployment config")
 
+    if origin_ok and "project" in cfg:
+        prepare_project(sdir, repo_dir, cfg["project"], env, boot_id, supervisor, report, check)
     return finish()
 
 
@@ -401,10 +535,7 @@ class Supervisor:
                            detail="stopped by the sandbox (suspend or stop) while running; "
                                   "it is not re-run. The next tick lets Orbi resume the delivery.")
         if child and child.poll() is None:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            signal_group(child, signal.SIGTERM)
 
     def execute(self, run_id: str) -> None:
         log = None
@@ -499,7 +630,7 @@ class Supervisor:
         for run_id in recovered:
             print(f"ax-orbi-agent: run {run_id} was interrupted by the last stop; kept, not re-run",
                   flush=True)
-        report = prepare(self.sdir, self.boot_id)
+        report = prepare(self.sdir, self.boot_id, supervisor=self)
         self.prepared = report["ok"]
         for item in report["checks"]:
             if not item["ok"]:
@@ -520,9 +651,10 @@ class Supervisor:
             if run_id is None:
                 self.stopping.wait(1)
                 continue
-            if not self.prepared:
-                # Re-check instead of refusing forever: the cause may be gone.
-                self.prepared = prepare(self.sdir, self.boot_id)["ok"]
+            self.prepared = prepare(self.sdir, self.boot_id, supervisor=self)["ok"]
+            self.beat()
+            if self.stopping.is_set():
+                break
             if not self.prepared:
                 rdir = run_path(self.sdir, run_id)
                 rdir.mkdir(parents=True, exist_ok=True)
