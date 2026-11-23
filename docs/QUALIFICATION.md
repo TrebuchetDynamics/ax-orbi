@@ -5,6 +5,7 @@
 - Qualification summary: **NOT RUN**
 - Demonstrated advantage over Docker and its operating cost: **NOT RUN**
 - Owner's go/no-go decision and rationale: **NOT RUN**
+- Offline only — [`tests/test_unattended.py`](../tests/test_unattended.py): **PASS** against fake AX and Orbi for dependency restoration, interruption without tick replay, outage/backoff and recovery with one notification, pause across watch restarts, and continued ticks on a second deployment while the first needs its owner. This does not qualify live AX, GitHub, a provider, or a systemd service.
 
 This is a blank report for a future live trial, not a qualification claim. Use
 `PASS` when the stated rule is met with evidence, `FAIL` when a valid trial
@@ -681,6 +682,154 @@ options or a recovery that does not return the task to observable health.
 **Evidence.** Skill/agent version, prompts, transcript and executed commands: —;
 outputs/codes, raw states and elapsed times: —; unknown phrasing and recovery
 report: —; absence of forced/deletion options: —.
+
+### Q-H — Enable on a clean host
+
+**Result:** NOT RUN
+
+**Prerequisites.** Disposable host without the AX command or a running local
+AX cluster, with the [setup prerequisites](SETUP.md#prerequisites), a reachable
+registry with the pinned task digest, and permission to create the fixture's
+Secrets. Use the default `ax` command and set `[ax] local = true`. Prepare the
+image independently of the cluster startup; do not require enable to build it.
+
+1. From the checkout, run `timeout -s INT 3h bin/ax-orbi enable --config ./ax-orbi.toml --json`.
+   Save the host checks and whether AX was built and the local cluster started.
+   If enable reports missing Secrets after bootstrapping AX, create and label
+   them in the new context as in the setup guide, then retry enable.
+2. Record the installed AX command's version and the local cluster status.
+   Follow [Unattended operation](SETUP.md#unattended-operation) to start watch
+   and collect `status --json` through the first completed tick.
+
+**Pass** if enable builds the pinned AX command, starts a reachable local
+cluster, passes host checks with the prepared Secrets, and registers a
+working deployment that watch ticks without manual prepare/run. **Fail**
+if those outcomes need an undocumented workaround or cannot be reached.
+
+**Evidence.** Clean-host baseline, versions and timings: —; enable outputs,
+AX version and cluster status: —; Secret check results (no values): —;
+fleet status, first tick ID/outcome and deviations: —.
+
+### Q-I — Restore a removed dependency on AX
+
+**Result:** NOT RUN
+
+**Prerequisites.** Enabled disposable deployment on real AX with a committed
+`[project]` recipe and check for a removable, repository-local dependency.
+Watch is the only scheduler. Pick a tick interval that leaves time to inject
+and confirm the fault while idle.
+
+1. Record a successful watch tick and the passing dependency check. While
+   idle, remove only the chosen dependency in the sandbox and record the
+   failing check. Do not run the installer or request a tick manually.
+2. Let watch reach the next tick. Check the restored dependency, the agent's
+   project setup log and the next tick's distinct ID and terminal record.
+
+**Pass** if the recipe restores the dependency and the new tick succeeds
+without operator action after the removal. **Fail** for absent restoration,
+a failed tick, or manual repair required.
+
+**Evidence.** Recipe revision, dependency check before/remove/after: —;
+setup log, watch status and old/new tick IDs and outcomes: —; timings: —.
+
+### Q-J — Continue an interrupted worker on AX without a duplicate
+
+**Result:** NOT RUN
+
+**Prerequisites.** Enabled disposable deployment with watch as sole scheduler,
+a fresh eligible Issue, and permission for an AX-side suspend of the task
+while working. Use Q-B's GitHub snapshots and Q-C's delivery evidence.
+
+1. Capture the active watch tick ID, run record and Orbi claim before the
+   interruption. While the tick is active, run
+   `timeout 330s "${AX[@]}" suspend task "$TASK"` with the AX context and
+   task from Q-C. Do not use ax-orbi stop, which pauses the deployment.
+   Record the transition and retained workspace evidence as in Q-C.
+2. Let watch restore the sandbox, observe the old ID as `interrupted`, and
+   then run a new ID. Do not manually recover, request a tick or re-label the
+   Issue. Compare run/log records and GitHub history as in Q-C.
+
+**Pass** if watch restores the sandbox, the old ID is retained and never
+replayed, and the new tick continues the same delivery without a duplicate
+branch, PR or repeated delivery action. **Fail** for lost work, replay,
+duplicate effects or manual recovery. If the fault missed active work,
+record `NOT RUN` with the reason.
+
+**Evidence.** AX states and timestamps: —; old/new tick and delivery IDs,
+workspace evidence, run records and logs: —; Issue/PR/branch comparison: —.
+
+### Q-K — Provider or GitHub outage and recovery
+
+**Result:** NOT RUN
+
+**Prerequisites.** Healthy enabled disposable deployment, a fixture that will
+hit the selected provider or GitHub path, and a working host notification
+command. Arrange a reversible fault scoped to the fixture (not a shared
+service outage).
+
+1. Interrupt access to the selected service for the fixture. Capture the
+   actual failed tick logs and successive `status --json` samples, including
+   `nextActionAt`, the question and its options. Keep the fault through the
+   question and verify the notification destination receives one alert.
+2. Restore access and let watch try again at its deadline. Record the new
+   tick and status, and the question-opened, notify and question-closed events.
+
+**Pass** if watch backs off without requesting early ticks, opens one
+question and sends one alert, then completes a tick and closes the question
+without a manual tick or sandbox repair. **Fail** for retry storms, duplicate
+questions or alerts, or failure to recover after access is restored. If the
+injection did not produce a failed tick, record `NOT RUN` with the reason.
+
+**Evidence.** Fault/restoration and access evidence: —; tick IDs, redacted
+logs and retry timestamps: —; question ID, alert delivery and events: —.
+
+### Q-L — Keep a pause across a host restart
+
+**Result:** NOT RUN
+
+**Prerequisites.** Disposable watch host running the enabled user unit from
+[setup](SETUP.md#start-the-user-service), with persistent fleet/state and
+lingering if testing without a login. Use a working, idle deployment.
+
+1. Pause the deployment with a reason, capture its `status --json` and last
+   tick ID, then reboot the watch host without changing its state directory.
+2. Verify the user unit restarted and observe several passes, including one
+   past when a tick would have been due. Save fresh status and AX/sandbox
+   observations.
+
+**Pass** if desired mode, reason and change time persist, watch reports
+`paused`, and there is no new tick or changing AX action for the deployment.
+**Fail** if pause is lost or the deployment changes while paused.
+
+**Evidence.** Boot and unit timestamps: —; before/after status and tick
+records: —; AX task/action evidence through the observation window: —.
+
+### Q-M — Run the systemd user watch service for 24 hours
+
+**Result:** NOT RUN
+
+**Prerequisites.** Pinned disposable deployment, a provider budget for the
+trial, and `ax-orbi-watch.service` installed with `systemctl --user` as in
+[setup](SETUP.md#start-the-user-service). Do not run another scheduler.
+
+1. Record the user service state and time at the start. Leave it running for
+   24 hours; periodically record fleet status, tick outcomes, questions and
+   journal diagnostics. Log every manual intervention with time and reason;
+   distinguish read-only observations from actions that sustain or restore work.
+2. Record end time, service state, tick outcomes, service restarts and the
+   total number of manual interventions.
+
+**Pass** if the service sustains recurring successful ticks for the full
+window with zero manual interventions after setup. Report the count even if
+nonzero. **Fail** for an attempted trial that needs an intervention to keep
+work running or cannot show continued progress over the window.
+
+**Evidence.** Unit and host versions, UTC start/end: —; unit status and
+journal: —; status/tick timeline and gaps: —; manual intervention log and
+count: —.
+
+One repair for several pull requests blocked by shared CI belongs to Orbi,
+not this milestone; it is not part of these qualification scenarios.
 
 ## Threats to validity
 
