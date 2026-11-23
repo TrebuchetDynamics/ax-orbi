@@ -25,8 +25,6 @@ For live AX trials, see the [qualification runbook](docs/QUALIFICATION.md).
 
 GitHub Actions runs offline tests and syntax checks on every push to `main` and every pull request, and runs container verification when image inputs change or on manual dispatch.
 
-The existing verifier can fail in phase 5 with `Orbi rejected the generated configuration` after GitHub rejects the verifier's placeholder credentials. This is not an error in your TOML; the verifier does not read your deployment config or Secrets.
-
 ## Install the skill
 
 Import or copy the entire [`skills/ax-orbi/`](skills/ax-orbi/) directory into your agent's skills location using its Agent Skills installation instructions. The [operator skill](skills/ax-orbi/SKILL.md) also needs shell access on the AX CLI host and a checkout of this repository; installing the skill doesn't grant AX access. Use the [setup guide](docs/SETUP.md) to configure a deployment.

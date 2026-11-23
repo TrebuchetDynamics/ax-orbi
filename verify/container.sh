@@ -18,7 +18,32 @@
 # and `ax ssh` itself.
 set -euo pipefail
 
+classify_real_tick() { # classify_real_tick <owner/repo>, reading the log on stdin
+  python3 -c '
+import sys
+
+url = f"https://github.com/{sys.argv[1]}.git"
+auth_errors = tuple(f"fatal: Authentication failed for {remote!r}" for remote in (url, url + "/"))
+lines = sys.stdin.read().splitlines()
+# The pinned Orbi tick emits these diagnostics from runner._load_valid_config.
+if any(line.startswith(("ERROR config_invalid reason=", "ERROR config_not_found path="))
+       for line in lines):
+    print("config-rejected")
+elif any(f"transport_unreachable: git ls-remote {url} failed:" in line
+         or line.startswith(auth_errors) for line in lines):
+    print("expected-failure")
+else:
+    print("unknown")
+' "$1"
+}
+
+if [ "${1:-}" = --classify-real-tick ]; then
+  classify_real_tick "${2:?usage: verify/container.sh --classify-real-tick <owner/repo>}"
+  exit
+fi
+
 IMAGE="${1:?usage: verify/container.sh <image>}"
+SOURCE_REPO=example/demo
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ID="ax-orbi-verify-$$"
 VOL="$ID-workspace"
@@ -66,7 +91,7 @@ write_specs() { # write_specs <fake|real>
     - name: FAKE_ORBI_LOG
       value: "/workspace/.fake-ticks"'
   fi
-  cat > "$SPEC/workspace.yaml" <<'EOF'
+  cat > "$SPEC/workspace.yaml" <<EOF
 apiVersion: ax.io/v1alpha1
 kind: Workspace
 metadata:
@@ -82,7 +107,7 @@ spec:
         git init -q -b main repo &&
         git -C repo -c user.name=verify -c user.email=verify@example.com
         commit -q --allow-empty -m init &&
-        git -C repo remote add origin https://github.com/example/demo.git &&
+        git -C repo remote add origin https://github.com/$SOURCE_REPO.git &&
         echo setup-ran >> /workspace/.setup-count
 EOF
   cat > "$SPEC/task.yaml" <<EOF
@@ -99,7 +124,7 @@ spec:
     name: orbi-verify-ws
   env:
     - name: AX_ORBI_CONFIG
-      value: '{"source_repo": "example/demo", "base_branch": "main", "pi": {"provider": "verify", "model": "verify-model", "base_url": "https://model.invalid"}}'
+      value: '{"source_repo": "$SOURCE_REPO", "base_branch": "main", "pi": {"provider": "verify", "model": "verify-model", "base_url": "https://model.invalid"}}'
     - name: GH_TOKEN
       value: "placeholder"
     - name: PI_API_KEY
@@ -182,16 +207,18 @@ start
 field "[c['detail'] for c in s['prepare']['checks'] if c['name'].startswith('tool:')]"
 agent request-tick --id t-real >/dev/null
 wait_for "the real tick to finish" sh -c "docker exec $ID /usr/local/bin/ax-orbi-agent status --json --run t-real | grep -Eq '\"status\": \"(succeeded|failed)\"'"
-echo "  real tick: status=$(run_field t-real status) exit=$(run_field t-real exitCode)"
+real_status="$(run_field t-real status)"
+echo "  real tick: status=$real_status exit=$(run_field t-real exitCode)"
+real_log="$(agent logs --run t-real --tail 200)" || fail "could not read the real tick log"
 echo "  --- real Orbi output (last 12 lines) ---"
-agent logs --run t-real --tail 12 | sed 's/^/  | /'
-# With a placeholder token and no gateway there is nothing to deliver, so the
-# only acceptable outcome is that Orbi itself started, read the generated
-# config, and stopped with its own diagnosis.
-if agent logs --run t-real --tail 200 | grep -Eqi "orbi.toml|unknown key|invalid config|config error|Traceback"; then
-  fail "Orbi rejected the generated configuration"
-fi
-[ "$(run_field t-real status)" = failed ] && pass "Orbi ran and its failure was recorded, not hidden" \
-  || fail "expected the unauthenticated tick to fail, got $(run_field t-real status)"
+printf '%s\n' "$real_log" | tail -12 | sed 's/^/  | /'
+[ "$real_status" = failed ] || fail "expected the unauthenticated tick to fail, got $real_status"
+
+# The placeholder credentials should let Orbi start, but not reach a delivery.
+case "$(classify_real_tick "$SOURCE_REPO" <<< "$real_log")" in
+  expected-failure) pass "Orbi reached GitHub for $SOURCE_REPO and the transport failure was recorded" ;;
+  config-rejected) fail "Orbi rejected the generated configuration" ;;
+  *) fail "unknown real tick failure; see the Orbi output above" ;;
+esac
 
 printf '\n%d checks passed\n' "$PASSED"
