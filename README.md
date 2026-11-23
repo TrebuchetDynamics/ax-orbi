@@ -33,7 +33,7 @@ Import or copy the entire [`skills/ax-orbi/`](skills/ax-orbi/) directory into yo
 
 ## CLI
 
-Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `--json`. The fleet commands (`enable`, `pause`, `resume`, `status`) accept `--fleet DIR` to override `$AX_ORBI_FLEET` or the default deployment directory (`$XDG_CONFIG_HOME/ax-orbi/deployments`, normally `~/.config/ax-orbi/deployments`). Other commands accept `-c` / `--config` (default `./ax-orbi.toml`).
+Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `--json`. The fleet commands (`enable`, `pause`, `resume`, `status`, `watch`) accept `--fleet DIR` to override `$AX_ORBI_FLEET` or the default deployment directory (`$XDG_CONFIG_HOME/ax-orbi/deployments`, normally `~/.config/ax-orbi/deployments`). Other commands accept `-c` / `--config` (default `./ax-orbi.toml`).
 
 | Command | What it does |
 | --- | --- |
@@ -48,7 +48,8 @@ Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `--json`
 | `enable NAME` or `enable --config PATH` | Enables a fleet deployment; `--config` also registers the file in the fleet. |
 | `pause NAME [--reason TEXT]` | Records a pause without changing the AX sandbox. |
 | `resume NAME` | Re-enables a paused deployment without changing the AX sandbox. |
-| `status [NAME]` | Lists fleet deployments and their recorded modes without contacting AX. |
+| `status [NAME]` | Lists fleet deployments, their recorded modes and watch phase, detail and age without contacting AX. |
+| `watch [--once] [--interval SECONDS] [--fleet DIR] [--print-unit]` | Keeps enabled deployments ticking and leaves paused ones alone. Sleeps 30 seconds after each scan by default; `--once` scans once. Set `[watch]` `tick_interval` to space ticks (default 300 seconds, minimum 60) without changing the Task. `--print-unit` only prints a systemd user unit. |
 
 Exit codes: `0` command succeeded (possibly with warnings), `1` operation, check or tick failed, `2` bad usage or configuration, `3` interrupted, pending or unknown outcome. `check --json` lists warnings in `unverified`; it checks digest syntax (`image-pinned`), not the running image's `image-pins`. See [Interpreting results](docs/SETUP.md#interpreting-results) for the `taskState` classes, pin verification and what `executionUnknown` means after a forced stop.
 

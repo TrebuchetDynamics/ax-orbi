@@ -12,7 +12,8 @@
   ax-orbi enable    enable a fleet deployment or register one with --config
   ax-orbi pause     record that a deployment should stay paused
   ax-orbi resume    re-enable a paused deployment
-  ax-orbi status    list fleet deployments and their recorded modes
+  ax-orbi status    list fleet deployments and their recorded modes and watch activity
+  ax-orbi watch     keep enabled fleet deployments ticking outside AX
 
 Every command takes --json. The fleet commands take --fleet; the other
 commands take -c/--config (default ./ax-orbi.toml).
@@ -24,11 +25,14 @@ Standard library only; needs Python 3.11+.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -36,14 +40,14 @@ import tempfile
 import time
 import tomllib
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 3
 
-NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,48}[a-z0-9])?$")
+NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,48}[a-z0-9])?\Z")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 HOST_RE = re.compile(r"^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
 SECRET_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?/[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
@@ -141,6 +145,13 @@ def load_config(path: Path) -> dict:
     orbi = cfg.setdefault("orbi", {})
     if not isinstance(orbi, dict):
         errors.append("[orbi] must be a table of Orbi settings")
+    watch = cfg.setdefault("watch", {})
+    if not isinstance(watch, dict):
+        errors.append("[watch] must be a table")
+    else:
+        interval = watch.setdefault("tick_interval", 300)
+        if type(interval) is not int or interval < 60:
+            errors.append("watch.tick_interval must be an integer of at least 60 seconds")
 
     if errors:
         raise ConfigError(f"{path}:\n  - " + "\n  - ".join(errors))
@@ -273,8 +284,9 @@ TASK_CLASSES = {
 
 
 class Ax:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, *, start_new_session: bool = False):
         self.cfg = cfg
+        self.start_new_session = start_new_session
         self.base = [cfg["ax"]["bin"], "-a", cfg["ax"]["atespace"]]
         if cfg["ax"].get("context"):
             self.base += ["--context", cfg["ax"]["context"]]
@@ -282,7 +294,7 @@ class Ax:
     def run(self, *args: str, stdin: str | None = None, timeout: float = 900):
         try:
             proc = subprocess.run(self.base + list(args), input=stdin, text=True,
-                                  capture_output=True, timeout=timeout)
+                                  capture_output=True, timeout=timeout, start_new_session=self.start_new_session)
         except FileNotFoundError:
             return 127, "", f"{self.base[0]}: not found on PATH"
         except subprocess.TimeoutExpired:
@@ -739,9 +751,12 @@ def fleet_dir(override: Path | None) -> Path:
                              xdg_orbi_dir("XDG_CONFIG_HOME", ".config") / "deployments")).absolute()
 
 
+def state_home() -> Path:
+    return Path(os.environ.get("AX_ORBI_HOME") or xdg_orbi_dir("XDG_STATE_HOME", ".local/state"))
+
+
 def desired_path(name: str) -> Path:
-    home = Path(os.environ.get("AX_ORBI_HOME") or xdg_orbi_dir("XDG_STATE_HOME", ".local/state"))
-    return home / "deployments" / name / "desired.json"
+    return state_home() / "deployments" / name / "desired.json"
 
 
 def read_state(path: Path) -> dict | None:
@@ -763,9 +778,7 @@ def read_desired(path: Path) -> dict | None:
     return state
 
 
-def write_desired(path: Path, mode: str, reason: str) -> None:
-    record = {"version": 1, "mode": mode, "reason": reason,
-              "changedAt": datetime.now(timezone.utc).isoformat()}
+def write_state(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fh = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
     tmp = Path(fh.name)
@@ -776,8 +789,18 @@ def write_desired(path: Path, mode: str, reason: str) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         tmp.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def write_desired(path: Path, mode: str, reason: str) -> None:
+    write_state(path, {"version": 1, "mode": mode, "reason": reason,
+                       "changedAt": datetime.now(timezone.utc).isoformat()})
 
 
 def load_fleet_config(path: Path) -> dict:
@@ -792,25 +815,30 @@ def load_fleet_config(path: Path) -> dict:
         raise ConfigError(f"{path}: invalid deployment config: {exc}") from None
 
 
-def fleet_entries(fleet: Path) -> list[dict]:
+def fleet_entries(fleet: Path, *, include_config: bool = False) -> list[dict]:
     try:
         paths = sorted(fleet.iterdir())
     except FileNotFoundError:
         return []
     entries = []
     for path in paths:
-        if not path.match("*.toml") or (not path.is_symlink() and path.is_dir()):
+        if not path.match("*.toml"):
             continue
         entry = {"configPath": str(path)}
         try:
+            if not path.is_symlink() and path.is_dir():
+                continue
             cfg = load_fleet_config(path)
-        except ConfigError as exc:
+        except Exception as exc:
             entry["configError"] = str(exc)
             # Preserve the declared identity even when another field is invalid.
             try:
                 cfg = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-            except (OSError, ValueError):
+            except Exception:
                 cfg = {}
+        else:
+            if include_config:
+                entry["config"] = cfg
         name, repository = cfg.get("name"), cfg.get("repository")
         source = repository.get("source") if isinstance(repository, dict) else None
         entry.update(name=name if isinstance(name, str) else None,
@@ -904,6 +932,11 @@ def cmd_status(args, report: Report) -> int:
                 watch = read_state(path.with_name("watch.json"))
                 if watch is not None:
                     entry["watch"] = watch
+                    try:
+                        at = datetime.fromisoformat(watch.get("at"))
+                        entry["watchAgeSeconds"] = max(0, int((datetime.now(timezone.utc) - at).total_seconds()))
+                    except (TypeError, ValueError):
+                        pass
             deployments.append(entry)
             reason = f" ({entry['reason']})" if entry["reason"] else ""
             repository = f" ({entry['repository']})" if entry["repository"] else ""
@@ -911,6 +944,10 @@ def cmd_status(args, report: Report) -> int:
             report.say(f"{name or '<unknown>'}{repository}: {entry['desired']}{reason}{changed} [{entry['configPath']}]")
             if "configError" in entry:
                 report.say(f"  config error: {entry['configError']}")
+            watch = entry.get("watch")
+            if watch and watch.get("phase"):
+                age = f" ({entry['watchAgeSeconds']}s ago)" if "watchAgeSeconds" in entry else ""
+                report.say(f"  {watch['phase']}: {watch.get('detail', '')}{age}")
         if not deployments:
             if args.name is not None:
                 print(f"no fleet config named {args.name!r} in {fleet}; register it with enable --config PATH",
@@ -923,6 +960,164 @@ def cmd_status(args, report: Report) -> int:
         code = EXIT_FAILED
     report.data.pop("checks")  # status has a deployments envelope, not a check report
     return report.finish(code, deployments=deployments)
+
+
+def watch_step(cfg: dict, state: dict, path: Path) -> tuple[str, str]:
+    """Observe once, then make at most one change within a 120-second AX budget."""
+    # A foreground Ctrl-C should reach watch, not cancel its current AX command.
+    ax, task = Ax(cfg, start_new_session=True), names(cfg)["task"]
+    observed = ax.task_state(task, timeout=40)
+    state["taskState"] = "NotFound" if observed == "" else observed
+    kind = TASK_CLASSES.get(observed, "unrecognised")
+    if kind in ("missing", "checkpointed"):
+        if kind == "missing":
+            code, out, err = ax.run("apply", "-f", "-", stdin=render(cfg), timeout=80)
+            phase, detail = "preparing", "Creating the sandbox"
+        else:
+            code, out, err = ax.run("resume", "task", task, timeout=80)
+            phase, detail = "resuming", "Restoring the sandbox"
+        if code != 0:
+            raise RuntimeError(f"{detail} failed: {(err or out).strip() or f'AX exited {code}'}")
+        return phase, detail
+    if kind == "unreachable":
+        return "waiting", "Waiting for AX to answer"
+    if kind == "transitional":
+        return "waiting", f"Waiting for the sandbox while it is {observed}"
+    if kind == "failed":
+        return "blocked", f"Sandbox task is {observed}"
+    if kind != "active":
+        return "blocked", f"Unrecognised AX state {observed!r}"
+
+    pending = state["pendingTick"]
+    query = ["--run", pending["id"]] if pending else []
+    # --run still returns health and counts (with a nonzero exit) for an unknown ID.
+    status, err = ax.agent(task, "status", "--json", *query, timeout=40, allow_status_error=bool(pending))
+    now = datetime.now(timezone.utc)
+    if not status or not status.get("started"):
+        state["startingSince"] = state["startingSince"] or now.isoformat()
+        return "starting", "Waiting for the sandbox agent to start"
+    state["startingSince"] = None
+    prepare = Report(as_json=True)
+    if not report_prepare(prepare, status, err):
+        failure = next((check["detail"] for check in prepare.data["checks"] if check["ok"] is False),
+                       "prepare checks did not pass")
+        return "blocked", f"Sandbox is not ready: {' '.join(failure.split())}"
+
+    current = (status.get("health") or {}).get("currentRun") if status.get("supervisorAlive") else None
+    if current:
+        return "ticking", f"Orbi tick {current} is running"
+    if (status.get("counts") or {}).get("queued"):
+        return "ticking", "An Orbi tick is queued"
+
+    runs = status.get("runs") or []
+    run = runs[0] if pending and runs and runs[0].get("id") == pending["id"] else {}
+    if run.get("status") in ("succeeded", "failed", "interrupted"):
+        next_action = now + timedelta(seconds=cfg["watch"]["tick_interval"])
+        state.update(lastTick={key: run.get(key) for key in ("id", "status", "finishedAt")},
+                     pendingTick=None, nextActionAt=next_action.isoformat())
+        return "idle", f"Next tick at {next_action:%H:%M UTC}"
+    if not pending and state["nextActionAt"]:
+        next_action = datetime.fromisoformat(state["nextActionAt"])
+        if now < next_action:
+            return "idle", f"Next tick at {next_action:%H:%M UTC}"
+
+    if pending is None:
+        pending = {"id": f"watch-{now:%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}", "requestedAt": now.isoformat()}
+        state["pendingTick"] = pending
+        state.update(at=now.isoformat(), phase="ticking", detail=f"Requesting Orbi tick {pending['id']}")
+        write_state(path, state)  # Persist the id before AX can deliver it to the agent.
+    answer, err = ax.agent(task, "request-tick", "--id", pending["id"], timeout=40)
+    if not answer:
+        raise RuntimeError(f"Could not request Orbi tick {pending['id']}: {err}")
+    return "ticking", f"Requested Orbi tick {pending['id']}"
+
+
+def watch_deployment(entry: dict) -> None:
+    name = entry["name"]
+    if not name or not NAME_RE.match(name):
+        return  # Only status reports configurations with no valid identity.
+    desired = desired_path(name)
+    path = desired.with_name("watch.json")
+    state = dict(desired=None, taskState=None, pendingTick=None, lastTick=None,
+                 nextActionAt=None, startingSince=None)
+    try:
+        state.update(read_state(path) or {})
+        state.update(version=1, deployment=name, desired=None, taskState=None)
+        record = read_desired(desired)
+        if record is not None:
+            state["desired"] = record["mode"]
+        if "configError" in entry:
+            phase, detail = "config-error", entry["configError"]
+        elif record is None:
+            return
+        else:
+            cfg = entry["config"]
+            if "notify_command" in cfg["watch"]:
+                state["notifyCommand"] = cfg["watch"]["notify_command"]
+            if record["mode"] == "paused":
+                phase, detail = "paused", "Deployment is paused"
+            else:
+                phase, detail = watch_step(cfg, state, path)
+    except Exception as exc:
+        phase, detail = "blocked", str(exc) or type(exc).__name__
+    state.update(version=1, deployment=name, at=datetime.now(timezone.utc).isoformat(),
+                 phase=phase, detail=" ".join(detail.split()))
+    try:
+        write_state(path, state)
+    except Exception as exc:
+        print(f"Cannot write watch state for {name}: {exc}", file=sys.stderr)
+
+
+def cmd_watch(args, report: Report) -> int:
+    if args.print_unit:
+        executable = str(ROOT / "bin" / "ax-orbi").replace("%", "%%")
+        if re.search(r"[\s\"'\\]", executable):
+            executable = json.dumps(executable, ensure_ascii=False)
+        unit = ("[Unit]\nDescription=ax-orbi fleet watch\n\n"
+                f"[Service]\nExecStart={executable} watch\nRestart=on-failure\n"
+                "KillMode=mixed\nTimeoutStopSec=125s\n\n[Install]\nWantedBy=default.target\n")
+        report.say(unit.rstrip())
+        return report.finish(EXIT_OK, unit=unit)
+    if not 0 < args.interval < float("inf"):
+        raise ConfigError("--interval must be a positive number of seconds")
+
+    lock_path = state_home() / "watch.lock"
+    stop = False
+
+    def request_stop(_signal, _frame):
+        nonlocal stop
+        stop = True
+
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                report.check("watch", False, f"Another ax-orbi watch holds {lock_path}",
+                             "stop that instance before starting another")
+                return report.finish(EXIT_FAILED)
+            signals = (signal.SIGTERM, signal.SIGINT)
+            previous = [signal.signal(sig, request_stop) for sig in signals]
+            try:
+                fleet = fleet_dir(args.fleet)
+                while not stop:
+                    for entry in fleet_entries(fleet, include_config=True):
+                        if stop:
+                            break
+                        watch_deployment(entry)
+                    if args.once:
+                        break
+                    deadline = time.monotonic() + args.interval
+                    while not stop and (remaining := deadline - time.monotonic()) > 0:
+                        time.sleep(min(1, remaining))
+            finally:
+                for sig, handler in zip(signals, previous):
+                    signal.signal(sig, handler)
+    except OSError as exc:
+        report.check("watch", False, str(exc))
+        return report.finish(EXIT_FAILED)
+    return report.finish(EXIT_OK)
 
 
 def pause_for_stop(name: str, report: Report) -> bool:
@@ -1086,8 +1281,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", default="", help="reason to record with the pause")
     p = sub.add_parser("resume", parents=[fleet], help="re-enable a paused deployment")
     p.add_argument("name", metavar="NAME")
-    p = sub.add_parser("status", parents=[fleet], help="list fleet deployments and their recorded modes")
+    p = sub.add_parser("status", parents=[fleet], help="list fleet deployments and watch activity")
     p.add_argument("name", nargs="?", metavar="NAME")
+    p = sub.add_parser("watch", parents=[fleet], help="keep enabled fleet deployments ticking")
+    p.add_argument("--once", action="store_true", help="make one pass and exit")
+    p.add_argument("--interval", type=float, default=30, metavar="SECONDS",
+                   help="sleep between passes (default: 30 seconds)")
+    p.add_argument("--print-unit", action="store_true", help="only print a systemd user unit")
     return parser
 
 
@@ -1097,7 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
     handler = {"check": cmd_check, "build": cmd_build, "render": cmd_render, "prepare": cmd_prepare,
                "run": cmd_run, "inspect": cmd_inspect, "stop": cmd_stop, "recover": cmd_recover,
                "enable": cmd_enable, "pause": cmd_pause_resume, "resume": cmd_pause_resume,
-               "status": cmd_status}
+               "status": cmd_status, "watch": cmd_watch}
     try:
         return handler[args.command](args, report)
     except ConfigError as exc:
