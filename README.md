@@ -30,7 +30,7 @@ GitHub Actions runs offline tests and syntax checks on every push to `main` and 
 After [configuring AX, the image and Secrets](docs/SETUP.md), register your repository's deployment and check its fleet status. The example name is `demo`:
 
 ```sh
-bin/ax-orbi enable --config ./ax-orbi.toml
+timeout -s INT 3h bin/ax-orbi enable --config ./ax-orbi.toml
 bin/ax-orbi status demo
 ```
 

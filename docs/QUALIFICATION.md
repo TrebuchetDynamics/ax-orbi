@@ -690,9 +690,10 @@ report: —; absence of forced/deletion options: —.
 **Prerequisites.** Disposable host without the AX command or a running local
 AX cluster, with the [setup prerequisites](SETUP.md#prerequisites), a reachable
 registry with the pinned task digest, and permission to create the fixture's
-Secrets. Use the default `ax` command and set `[ax] local = true`.
+Secrets. Use the default `ax` command and set `[ax] local = true`. Prepare the
+image independently of the cluster startup; do not require enable to build it.
 
-1. From the checkout, run `timeout 7500s bin/ax-orbi enable --config ./ax-orbi.toml --json`.
+1. From the checkout, run `timeout -s INT 3h bin/ax-orbi enable --config ./ax-orbi.toml --json`.
    Save the host checks and whether AX was built and the local cluster started.
    If enable reports missing Secrets after bootstrapping AX, create and label
    them in the new context as in the setup guide, then retry enable.
@@ -740,9 +741,10 @@ a fresh eligible Issue, and permission for an AX-side suspend of the task
 while working. Use Q-B's GitHub snapshots and Q-C's delivery evidence.
 
 1. Capture the active watch tick ID, run record and Orbi claim before the
-   interruption. Use Q-D's direct AX suspend command while the tick is active;
-   do not use ax-orbi stop, which pauses the deployment. Record the transition and retained workspace
-   evidence as in Q-C.
+   interruption. While the tick is active, run
+   `timeout 330s "${AX[@]}" suspend task "$TASK"` with the AX context and
+   task from Q-C. Do not use ax-orbi stop, which pauses the deployment.
+   Record the transition and retained workspace evidence as in Q-C.
 2. Let watch restore the sandbox, observe the old ID as `interrupted`, and
    then run a new ID. Do not manually recover, request a tick or re-label the
    Issue. Compare run/log records and GitHub history as in Q-C.

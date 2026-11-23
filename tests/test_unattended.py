@@ -226,9 +226,9 @@ class DocumentedCommandTests(unittest.TestCase):
     def test_readme_and_setup_ax_orbi_examples_exist(self):
         parser = cli.build_parser()
         commands = next(a.choices for a in parser._actions if isinstance(a, argparse._SubParsersAction))
-        executable = r"(?:\./)?(?:bin/)?ax-orbi[ \t]+"
+        executable = r"(?:timeout (?:-s INT )?\d+[smhd]? )?(?:\./)?(?:bin/)?ax-orbi[ \t]+"
         inline = re.compile(r"`" + executable + r"([^`\n]+)`")
-        shell = re.compile(r"^[ \t]*(?:timeout \d+s )?" + executable + r"([^\n;&|<>]+)", re.MULTILINE)
+        shell = re.compile(r"^[ \t]*" + executable + r"([^\n;&|<>]+)", re.MULTILINE)
         for path in (ROOT / "README.md", ROOT / "docs" / "SETUP.md"):
             prose_and_fences = re.split(r"^```[^\n]*\n", path.read_text(), flags=re.MULTILINE)
             examples = [sample for prose in prose_and_fences[::2] for sample in inline.findall(prose)]
@@ -238,10 +238,11 @@ class DocumentedCommandTests(unittest.TestCase):
             for sample in examples:
                 with self.subTest(path=path, example=sample):
                     argv = shlex.split(sample, comments=True)
+                    self.assertTrue(argv, "expected an ax-orbi subcommand or option")
                     if argv[0].startswith("-"):
                         command = parser  # e.g. the top-level --help example
                     else:
-                        self.assertIn(argv[0], set(commands))
+                        self.assertIn(argv[0], commands)
                         command = commands[argv.pop(0)]
                     options = {option for action in command._actions for option in action.option_strings}
                     for arg in argv:

@@ -18,7 +18,7 @@ Run from the checkout that contains `bin/ax-orbi`, not the repository being depl
 
 ## “Enable this repository and keep it working”
 
-Confirm the target and pinned image/Secret configuration first. From the checkout, use `bin/ax-orbi enable --json --config ./ax-orbi.toml` to register it, or `bin/ax-orbi enable --json "$NAME"` if registered. This can prepare the host and start local AX if configured; relay failed checks and `fix` text before proceeding. Follow **Unattended operation** in the setup guide to install the systemd user service with the operator's authorization, or verify the intended watch is already running. Check `bin/ax-orbi status --json "$NAME"` for desired mode, phase, freshness and any completed tick. An enabled record alone does not prove watch is running; don't request a manual tick to make it look healthy. Report what was observed and what is still unverified on AX.
+Confirm the target and pinned image/Secret configuration first. From the checkout, use `timeout -s INT 3h bin/ax-orbi enable --json --config ./ax-orbi.toml` to register it, or `timeout -s INT 3h bin/ax-orbi enable --json "$NAME"` if registered. This can prepare the host and start local AX if configured; relay failed checks and `fix` text before proceeding. Follow **Unattended operation** in the setup guide to install the systemd user service with the operator's authorization, or verify the intended watch is already running. Check `bin/ax-orbi status --json "$NAME"` for desired mode, phase, freshness and any completed tick. An enabled record alone does not prove watch is running; don't request a manual tick to make it look healthy. Report what was observed and what is still unverified on AX.
 
 ## “Why is it waiting on me?”
 
