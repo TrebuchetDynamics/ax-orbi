@@ -166,18 +166,23 @@ class Sandbox:
         return json.loads(out)
 
     def wait_ready(self):
-        proc = self.procs[-1]
+        proc = self.procs[-1] if self.procs else None
 
         def started():
-            if proc.poll() is not None:
-                output, _ = proc.communicate(timeout=1)
-                raise AssertionError(f"supervisor exited {proc.returncode}:\n{output}")
-            status = self.status()
-            # A resumed supervisor can acquire the lock before publishing its
-            # health, while both status files still describe the previous boot.
-            return status["started"] and status["health"]["pid"] == proc.pid
+            if proc is not None:
+                if proc.poll() is not None:
+                    output, _ = proc.communicate(timeout=1)
+                    raise AssertionError(f"supervisor exited {proc.returncode}:\n{output}")
+                # Wait for this boot to publish health before invoking status:
+                # its lock probe can race startup, and files from a previous
+                # boot can still be present.
+                health = agent.read_json(self.state / "health.json") or {}
+                if health.get("pid") != proc.pid:
+                    return False
+            # The watch tests start the supervisor via fake AX, not serve().
+            return self.status()["started"]
 
-        wait_until(started, what=f"supervisor {proc.pid}")
+        wait_until(started, what="supervisor")
 
     def wait_status(self, run_id: str, *statuses: str) -> dict:
         return wait_until(lambda: (r := self.run_record(run_id))["status"] in statuses and r,
@@ -580,11 +585,14 @@ class AgentTests(unittest.TestCase):
                     sb.wait_ready()
                     (sb.repo / "dependency").unlink()
                     (sb.repo / script).write_text(hanging)
-                sb.request("t-stopped")
+                if not at_start:
+                    sb.request("t-stopped")
                 pids = wait_until(lambda: pidfile.exists() and pidfile.read_text().split(),
                                   timeout=5, what="project script to start")
                 leader, sleeper = map(int, pids)
                 try:
+                    if at_start:
+                        sb.request("t-stopped")
                     os.kill(sleeper, 0)
                     proc.send_signal(sig)
                     self.assertEqual(proc.wait(timeout=5), 0)
