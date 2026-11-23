@@ -578,6 +578,10 @@ class WatchTests(FleetTestCase):
         self.watch_once()
         self.assert_backoff(1800)
         self.assertEqual(state["question"], self.watch_state()["question"])
+        self.set_task_phase(sb, "Queued")  # A failed task isn't verified until active and ready.
+        self.make_due()
+        self.watch_once()
+        self.assertEqual(state["question"], self.assert_backoff(1800)["question"])
         self.assertFalse(any(args[0] == "delete" for args in self.calls(sb)))
 
     def test_events_rotate_and_unrecognised_state_never_recreates(self):
@@ -636,6 +640,30 @@ class WatchTests(FleetTestCase):
         self.assertEqual(self.watch_state()["attempts"], 0)
         self.assertEqual(json.loads(self.desired.read_text())["mode"], "enabled")
 
+    def test_partial_delete_does_not_apply_over_old_workspace(self):
+        sb = self.deployment()
+        self.configure_watch("recreate_failed = true\n")
+        self.watch_once()
+        self.set_task_phase(sb, "Failed")
+        self.wrap_ax(sb, 'if [ "$3 $4" = "delete workspace" ]; then echo "workspace busy" >&2; exit 1; fi\n')
+        for attempt, delay in enumerate((60, 300, 900, 1800), 1):
+            if attempt > 1:
+                self.make_due()
+            self.watch_once()
+            state = self.assert_backoff(delay)
+            self.assertEqual((state["cause"], state["attempts"]), ("task:Failed", attempt))
+        self.assertEqual(state["phase"], "needs-owner")
+        changes = [args[0] for args in self.calls(sb) if args[0] in ("apply", "delete")]
+        self.assertEqual(changes, ["apply", "delete", "delete", "delete", "delete"])
+        repairs = [event for event in self.events() if event["action"] == "repair"]
+        self.assertEqual([event["result"] for event in repairs], ["workspace busy", "workspace busy"])
+
+        self.wrap_ax(sb)
+        self.command("stop", "--delete", "--yes-delete-state", "-c", str(self.fleet / "demo.toml"))
+        self.command("resume", "demo")
+        self.reach_tick()
+        self.assertIsNone(self.watch_state()["question"])
+
     def test_failing_notify_command_does_not_stop_the_pass(self):
         sb = self.deployment()
         _, output = self.configure_notify(exit_code=1)
@@ -649,6 +677,51 @@ class WatchTests(FleetTestCase):
         self.assertEqual(len(output.read_text().splitlines()), 3)
         self.assertIsNone(self.watch_state()["question"]["notifiedAt"])
 
+    def test_duplicate_configs_retry_notify_only_on_later_passes(self):
+        self.deployment()
+        config, output = self.configure_notify(exit_code=1)
+        self.watch_once()
+        (self.fleet / "duplicate.toml").write_text(config.read_text())
+        self.watch_once()
+        self.assertEqual(self.watch_state()["cause"], "config")
+        self.assertEqual(len(output.read_text().splitlines()), 1)
+        self.watch_once()
+        self.assertEqual(len(output.read_text().splitlines()), 2)
+
+    def test_timed_out_notify_stops_its_worker(self):
+        sb = self.deployment()
+        _, worker = self.configure_notify()
+        (self.root / "notify.py").write_text(
+            "import subprocess, sys\n"
+            "from pathlib import Path\n"
+            "child = subprocess.Popen(['sleep', '8'])\n"
+            "Path(sys.argv[1]).write_text(str(child.pid))\n"
+            "child.wait(timeout=9)\n"
+        )
+        self.watch_once()
+        self.set_task_phase(sb, "Failed")
+        communicate = subprocess.Popen.communicate
+
+        def shorten_notify(proc, input=None, timeout=None):
+            if proc.args[:2] == ["python3", str(self.root / "notify.py")]:
+                self.assertEqual(timeout, 30)
+                timeout = 1
+            return communicate(proc, input=input, timeout=timeout)
+
+        with patch.dict(os.environ, self.env), patch.object(subprocess.Popen, "communicate", shorten_notify):
+            self.assertEqual(cli.main(["watch", "--once"]), 0)
+        self.assertEqual(self.events()[-1]["result"], "timed out after 30s")
+        self.assertIsNone(self.watch_state()["question"]["notifiedAt"])
+        stat_path = Path("/proc") / worker.read_text() / "stat"
+
+        def stopped():
+            try:
+                return stat_path.read_text().rsplit(") ", 1)[1].startswith("Z ")
+            except FileNotFoundError:
+                return True
+
+        wait_until(stopped, timeout=1, what="notify worker to stop")
+
     def test_no_repair_while_a_tick_runs(self):
         sb = self.deployment()
         sb.set_mode("hang")
@@ -660,6 +733,27 @@ class WatchTests(FleetTestCase):
         self.env["FAKE_AX_STATUS"] = json.dumps(status)
         self.watch_once()
         self.assertFalse(any(args[0] == "suspend" for args in self.calls(sb)))
+        state = self.watch_state()
+        self.assertEqual((state["cause"], state["attempts"]), ("sandbox:project-setup", 1))
+        self.assertIsNone(state["nextActionAt"])
+
+    def test_failed_resume_is_bounded_during_a_repair(self):
+        sb = self.deployment()
+        self.make_ready(sb)
+        self.env["FAKE_AX_STATUS"] = json.dumps(self.failed_setup_status(sb))
+        self.watch_once()  # Suspend successfully, but the restore fails on the next pass.
+        self.wrap_ax(sb, 'if [ "$3" = resume ]; then echo "restore unavailable" >&2; exit 1; fi\n')
+        self.watch_once()
+        self.assertIn("restore unavailable", self.watch_state()["detail"])
+        self.watch_once()
+        self.assertEqual(self.watch_state()["attempts"], 1)
+        for delay in (300, 900, 1800):
+            self.make_due()
+            self.watch_once()
+            self.assert_backoff(delay)
+        state = self.watch_state()
+        self.assertEqual((state["cause"], state["phase"]), ("sandbox:project-setup", "needs-owner"))
+        self.assertEqual([event["action"] for event in self.events()], ["repair", "repair", "question-opened"])
 
     def test_sandbox_repair_is_bounded_across_restarts(self):
         sb = self.deployment()
@@ -726,11 +820,14 @@ class WatchTests(FleetTestCase):
         valid = config.read_text()
         config.write_text(valid + "tick_interval = 1\n")
         before = self.calls(sb)
-        for _ in range(4):
-            self.watch_once()
+        self.watch_once()
         state = self.watch_state()
         self.assertEqual((state["cause"], state["phase"]), ("config", "needs-owner"))
         self.assertIn("watch.tick_interval", state["detail"])
+        config.write_text(valid + "tick_interval = [\n")  # The declared name survives a TOML syntax error.
+        self.watch_once()
+        self.assertEqual(self.watch_state()["question"], state["question"])
+        self.assertNotIn("watch.tick_interval", self.watch_state()["detail"])
         notice, = map(json.loads, output.read_text().splitlines())
         self.assertEqual(notice["question"]["id"], state["question"]["id"])
         self.assertEqual(self.calls(sb), before)
@@ -738,6 +835,14 @@ class WatchTests(FleetTestCase):
         self.watch_once()
         self.assertIsNone(self.watch_state()["question"])
         self.assertEqual(self.watch_state()["phase"], "resuming")
+
+        state = self.watch_state()
+        state["notifyCommand"] = "legacy non-list value"
+        self.watch_path().write_text(json.dumps(state))
+        config.write_text(valid + "tick_interval = 1\n")
+        self.watch_once()
+        self.assertEqual(self.watch_state()["phase"], "needs-owner")
+        self.assertEqual(self.watch_state()["notifyAttempts"], 0)
 
     def test_status_shows_the_question(self):
         sb = self.deployment()
@@ -1091,16 +1196,16 @@ class WatchTests(FleetTestCase):
     def test_config_error_keeps_identity_and_the_last_notify_command(self):
         sb = self.deployment()
         self.command("pause", "demo")
-        config = self.fleet / "demo.toml"
-        valid = config.read_text() + '[watch]\nnotify_command = ["never-run-this"]\n'
-        config.write_text(valid)
+        config, output = self.configure_notify()
+        valid = config.read_text()
+        command = ["python3", str(self.root / "notify.py"), str(output)]
         self.watch_once()
-        self.assertEqual(self.watch_state()["notifyCommand"], ["never-run-this"])
-        config.write_text(valid.replace('["never-run-this"]', "2026-11-23"))
+        self.assertEqual(self.watch_state()["notifyCommand"], command)
+        config.write_text(valid.replace(json.dumps(command), "2026-11-23"))
         self.watch_once()
         self.assertEqual(self.watch_state()["phase"], "config-error")
         self.assertIn("watch.notify_command", self.watch_state()["detail"])
-        self.assertEqual(self.watch_state()["notifyCommand"], ["never-run-this"])
+        self.assertEqual(self.watch_state()["notifyCommand"], command)
 
         config.write_text(valid + "tick_interval = 10\n")
         (self.fleet / "bad.toml").write_text("not valid TOML")
@@ -1108,7 +1213,8 @@ class WatchTests(FleetTestCase):
         self.watch_once()
         entries = {entry["name"]: entry for entry in self.command("status")["deployments"]}
         self.assertEqual(entries["demo"]["watch"]["phase"], "config-error")
-        self.assertEqual(entries["demo"]["watch"]["notifyCommand"], ["never-run-this"])
+        self.assertEqual(entries["demo"]["watch"]["notifyCommand"], command)
+        self.assertFalse(output.exists())
         self.assertIn("configError", entries[None])
         self.assertNotIn("watch", entries[None])
         self.assertNotIn("watch", entries["unregistered"])
