@@ -7,10 +7,15 @@
   ax-orbi prepare   create and start the sandbox; no delivery is started
   ax-orbi run       run one Orbi tick and wait for its result
   ax-orbi inspect   sandbox health, the last runs and their evidence
-  ax-orbi stop      checkpoint the sandbox (state is kept)
+  ax-orbi stop      pause an enabled deployment and checkpoint its sandbox
   ax-orbi recover   bring a stopped sandbox back and report what was interrupted
+  ax-orbi enable    enable a fleet deployment or register one with --config
+  ax-orbi pause     record that a deployment should stay paused
+  ax-orbi resume    re-enable a paused deployment
+  ax-orbi status    list fleet deployments and their recorded modes
 
-Every command takes -c/--config (default ./ax-orbi.toml) and --json.
+Every command takes --json. The fleet commands take --fleet; the other
+commands take -c/--config (default ./ax-orbi.toml).
 Exit codes: 0 ok, 1 the thing checked or run failed, 2 bad usage or config,
 3 a run was interrupted or its outcome is unknown.
 
@@ -24,10 +29,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -721,6 +730,214 @@ def cmd_inspect(args, report: Report) -> int:
     return report.finish(EXIT_OK if ready and report.ok else EXIT_FAILED, status=status, logs=logs)
 
 
+def xdg_orbi_dir(variable: str, default: str) -> Path:
+    return Path(os.environ.get(variable) or Path.home() / default) / "ax-orbi"
+
+
+def fleet_dir(override: Path | None) -> Path:
+    return (override or Path(os.environ.get("AX_ORBI_FLEET") or
+                             xdg_orbi_dir("XDG_CONFIG_HOME", ".config") / "deployments")).absolute()
+
+
+def desired_path(name: str) -> Path:
+    home = Path(os.environ.get("AX_ORBI_HOME") or xdg_orbi_dir("XDG_STATE_HOME", ".local/state"))
+    return home / "deployments" / name / "desired.json"
+
+
+def read_state(path: Path) -> dict | None:
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except ValueError as exc:
+        raise ValueError(f"invalid state in {path}: {exc}") from None
+    if not isinstance(state, dict):
+        raise ValueError(f"expected a JSON object in {path}")
+    return state
+
+
+def read_desired(path: Path) -> dict | None:
+    state = read_state(path)
+    if state is not None and state.get("mode") not in ("enabled", "paused"):
+        raise ValueError(f"expected mode enabled or paused in {path}")
+    return state
+
+
+def write_desired(path: Path, mode: str, reason: str) -> None:
+    record = {"version": 1, "mode": mode, "reason": reason,
+              "changedAt": datetime.now(timezone.utc).isoformat()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
+    tmp = Path(fh.name)
+    try:
+        with fh:
+            json.dump(record, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def load_fleet_config(path: Path) -> dict:
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise ConfigError(f"{path}: expected a regular file for the deployment config")
+        return load_config(path)
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc.strerror}") from None
+    except (AttributeError, TypeError, ValueError) as exc:
+        # Invalid TOML field types can fail before load_config collects its errors.
+        raise ConfigError(f"{path}: invalid deployment config: {exc}") from None
+
+
+def fleet_entries(fleet: Path) -> list[dict]:
+    try:
+        paths = sorted(fleet.iterdir())
+    except FileNotFoundError:
+        return []
+    entries = []
+    for path in paths:
+        if not path.match("*.toml") or (not path.is_symlink() and path.is_dir()):
+            continue
+        entry = {"configPath": str(path)}
+        try:
+            cfg = load_fleet_config(path)
+        except ConfigError as exc:
+            entry["configError"] = str(exc)
+            # Preserve the declared identity even when another field is invalid.
+            try:
+                cfg = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            except (OSError, ValueError):
+                cfg = {}
+        name, repository = cfg.get("name"), cfg.get("repository")
+        source = repository.get("source") if isinstance(repository, dict) else None
+        entry.update(name=name if isinstance(name, str) else None,
+                     repository=source if isinstance(source, str) else None)
+        entries.append(entry)
+    counts = Counter(entry["name"] for entry in entries if entry["name"] is not None)
+    for entry in entries:
+        if counts[entry["name"]] > 1:
+            error = f"duplicate deployment name {entry['name']!r}; keep only one fleet config with that name"
+            entry["configError"] = f"{error}; {entry['configError']}" if "configError" in entry else error
+    return entries
+
+
+def fleet_entry(fleet: Path, name: str) -> dict | None:
+    matches = [entry for entry in fleet_entries(fleet) if entry["name"] == name]
+    if len(matches) > 1:
+        raise ConfigError(matches[0]["configError"])
+    return matches[0] if matches else None
+
+
+def cmd_enable(args, report: Report) -> int:
+    fleet = fleet_dir(args.fleet)
+    try:
+        if args.config is not None:
+            config = args.config.absolute()
+            name = load_fleet_config(config)["name"]
+            entry = fleet_entry(fleet, name)
+            if entry is not None and not Path(entry["configPath"]).samefile(config):
+                raise ConfigError(f"deployment {name!r} is already registered at {entry['configPath']}")
+            if entry is None:
+                fleet.mkdir(parents=True, exist_ok=True)
+                link = fleet / f"{name}.toml"
+                try:
+                    link.symlink_to(config)
+                except FileExistsError:
+                    raise ConfigError(f"cannot register {name!r}: {link} already exists") from None
+        else:
+            name = args.name
+            entry = fleet_entry(fleet, name)
+            if entry is None:
+                raise ConfigError(f"no fleet config named {name!r} in {fleet}; register it with enable --config PATH")
+            if "configError" in entry:
+                raise ConfigError(entry["configError"])
+        write_desired(desired_path(name), "enabled", "")
+    except OSError as exc:
+        report.check("enable", False, str(exc))
+        return report.finish(EXIT_FAILED)
+    report.check("enable", True, f"{name} enabled")
+    return report.finish(EXIT_OK)
+
+
+def cmd_pause_resume(args, report: Report) -> int:
+    name = args.name
+    if not NAME_RE.match(name):
+        raise ConfigError(f"invalid deployment name {name!r}")
+    try:
+        fleet_entry(fleet_dir(args.fleet), name)  # refuse ambiguous names even if a record exists
+        path = desired_path(name)
+        record = read_desired(path)
+        if record is None:
+            raise ConfigError(f"no desired-state record for {name!r}; enable it first")
+        if args.command == "pause":
+            mode = "paused"
+            write_desired(path, mode, args.reason)
+        else:
+            mode = "enabled"
+            if record["mode"] == "paused":
+                write_desired(path, mode, "")
+    except (OSError, ValueError) as exc:
+        report.check(args.command, False, str(exc))
+        return report.finish(EXIT_FAILED)
+    report.check(args.command, True, f"{name} {mode}")
+    return report.finish(EXIT_OK)
+
+
+def cmd_status(args, report: Report) -> int:
+    fleet = fleet_dir(args.fleet)
+    deployments = []
+    code = EXIT_OK
+    try:
+        for entry in fleet_entries(fleet):
+            name = entry["name"]
+            if args.name is not None and args.name != name:
+                continue
+            entry.update(desired="not-enabled", reason=None, changedAt=None)
+            if name is not None and NAME_RE.match(name):
+                path = desired_path(name)
+                record = read_desired(path)
+                if record is not None:
+                    entry.update(desired=record["mode"], reason=record.get("reason"), changedAt=record.get("changedAt"))
+                watch = read_state(path.with_name("watch.json"))
+                if watch is not None:
+                    entry["watch"] = watch
+            deployments.append(entry)
+            reason = f" ({entry['reason']})" if entry["reason"] else ""
+            repository = f" ({entry['repository']})" if entry["repository"] else ""
+            changed = f", changed at {entry['changedAt']}" if entry["changedAt"] else ""
+            report.say(f"{name or '<unknown>'}{repository}: {entry['desired']}{reason}{changed} [{entry['configPath']}]")
+            if "configError" in entry:
+                report.say(f"  config error: {entry['configError']}")
+        if not deployments:
+            if args.name is not None:
+                print(f"no fleet config named {args.name!r} in {fleet}; register it with enable --config PATH",
+                      file=sys.stderr)
+                code = EXIT_USAGE
+            else:
+                report.say(f"no deployments in {fleet}")
+    except (OSError, ValueError) as exc:
+        print(f"cannot read fleet status: {exc}", file=sys.stderr)
+        code = EXIT_FAILED
+    report.data.pop("checks")  # status has a deployments envelope, not a check report
+    return report.finish(code, deployments=deployments)
+
+
+def pause_for_stop(name: str, report: Report) -> bool:
+    path = desired_path(name)
+    reason = "stopped with ax-orbi stop"
+    try:
+        record = read_desired(path)
+        if record is not None and record["mode"] == "enabled":
+            write_desired(path, "paused", reason)
+            report.check("pause", True, f"{name} paused: {reason}")
+    except (OSError, ValueError) as exc:
+        return report.check("pause", False, str(exc))
+    return True
+
+
 def cmd_stop(args, report: Report) -> int:
     cfg = load_config(args.config)
     ax, n = Ax(cfg), names(cfg)
@@ -737,6 +954,8 @@ def cmd_stop(args, report: Report) -> int:
         detail = {"missing": f"task {task} does not exist",
                   "unreachable": "cannot reach the AX control plane to observe the task"}
         report.check("task", None, detail.get(kind, f"{task} reported state {state!r}"))
+        if not pause_for_stop(cfg["name"], report):
+            return report.finish(EXIT_FAILED)
         for resource, name in (("task", task), ("workspace", n["workspace"]), ("gateway", n["gateway"])):
             code, out, err = ax.run("delete", resource, name)
             # Only AX's resource-level NotFound confirms the resource is already absent.
@@ -747,10 +966,12 @@ def cmd_stop(args, report: Report) -> int:
                       else (err or out).strip() or f"ax delete {resource} exited {code}")
             report.check(f"delete:{resource}", code == 0 or absent, detail)
         return report.finish(EXIT_OK if report.ok else EXIT_FAILED, interruptedRun=None)
-    if kind == "missing":
-        report.check("task", None, f"task {task} does not exist; nothing to stop")
-        return report.finish(EXIT_OK)
-    if kind == "checkpointed":
+    if kind in ("missing", "checkpointed"):
+        if not pause_for_stop(cfg["name"], report):
+            return report.finish(EXIT_FAILED)
+        if kind == "missing":
+            report.check("task", None, f"task {task} does not exist; nothing to stop")
+            return report.finish(EXIT_OK)
         report.check("suspend", True, f"{task} is already {state}")
         return report.finish(EXIT_OK, interruptedRun=None)
     if kind != "active":
@@ -780,6 +1001,8 @@ def cmd_stop(args, report: Report) -> int:
         if not args.force:
             return report.finish(EXIT_INTERRUPTED)
         report.data["executionUnknown"] = True
+    if not pause_for_stop(cfg["name"], report):
+        return report.finish(EXIT_FAILED)
     code, out, err = ax.run("suspend", "task", task)
     if not report.check("suspend", code == 0,
                         f"{task} checkpointed; /workspace is kept" if code == 0 else (err or out).strip()):
@@ -850,6 +1073,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes-delete-state", action="store_true")
     p = sub.add_parser("recover", parents=[common], help="resume and report interrupted runs")
     p.add_argument("--timeout", type=int, default=300)
+
+    fleet = argparse.ArgumentParser(add_help=False)
+    fleet.add_argument("--fleet", type=Path, help="fleet config directory (overrides AX_ORBI_FLEET)")
+    fleet.add_argument("--json", action="store_true", help="print one JSON object")
+    p = sub.add_parser("enable", parents=[fleet], help="enable or register a fleet deployment")
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("name", nargs="?", metavar="NAME")
+    target.add_argument("--config", "-c", type=Path, metavar="PATH", help="register a deployment config")
+    p = sub.add_parser("pause", parents=[fleet], help="pause a deployment")
+    p.add_argument("name", metavar="NAME")
+    p.add_argument("--reason", default="", help="reason to record with the pause")
+    p = sub.add_parser("resume", parents=[fleet], help="re-enable a paused deployment")
+    p.add_argument("name", metavar="NAME")
+    p = sub.add_parser("status", parents=[fleet], help="list fleet deployments and their recorded modes")
+    p.add_argument("name", nargs="?", metavar="NAME")
     return parser
 
 
@@ -857,7 +1095,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     report = Report(args.json)
     handler = {"check": cmd_check, "build": cmd_build, "render": cmd_render, "prepare": cmd_prepare,
-               "run": cmd_run, "inspect": cmd_inspect, "stop": cmd_stop, "recover": cmd_recover}
+               "run": cmd_run, "inspect": cmd_inspect, "stop": cmd_stop, "recover": cmd_recover,
+               "enable": cmd_enable, "pause": cmd_pause_resume, "resume": cmd_pause_resume,
+               "status": cmd_status}
     try:
         return handler[args.command](args, report)
     except ConfigError as exc:

@@ -92,6 +92,8 @@ class Sandbox:
         self.env = dict(os.environ)
         self.env.update({
             "PATH": f"{FAKES}:{os.environ['PATH']}",
+            "AX_ORBI_HOME": str(self.tmp / "host-state"),
+            "AX_ORBI_FLEET": str(self.tmp / "fleet"),
             "AX_ORBI_STATE_DIR": str(self.state),
             "AX_ORBI_ORBI_BIN": str(FAKES / "orbi"),
             "AX_ORBI_VERSIONS_FILE": str(self.versions_file),
