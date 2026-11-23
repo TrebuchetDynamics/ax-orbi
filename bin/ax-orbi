@@ -9,7 +9,7 @@
   ax-orbi inspect   sandbox health, the last runs and their evidence
   ax-orbi stop      pause an enabled deployment and checkpoint its sandbox
   ax-orbi recover   bring a stopped sandbox back and report what was interrupted
-  ax-orbi enable    enable a fleet deployment or register one with --config
+  ax-orbi enable    prepare the host and enable a fleet deployment; --config registers it
   ax-orbi pause     record that a deployment should stay paused
   ax-orbi resume    re-enable a paused deployment
   ax-orbi status    list fleet deployments and their recorded modes and watch activity
@@ -46,6 +46,7 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 3
+DEFAULT_IMAGE_REPOSITORY = "localhost:5001/ax-orbi"
 
 NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,48}[a-z0-9])?\Z")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -65,7 +66,7 @@ class ConfigError(Exception):
 # ---- configuration ---------------------------------------------------------
 
 def load_versions(path: Path | None = None) -> dict:
-    with open(path or ROOT / "versions.toml", "rb") as fh:
+    with open(path or os.environ.get("AX_ORBI_VERSIONS_TOML") or ROOT / "versions.toml", "rb") as fh:
         return tomllib.load(fh)
 
 
@@ -142,6 +143,8 @@ def load_config(path: Path) -> dict:
     ax = cfg.setdefault("ax", {})
     ax.setdefault("atespace", "default")
     ax.setdefault("bin", "ax")
+    if not isinstance(ax.setdefault("local", False), bool):
+        errors.append("ax.local must be a boolean")
     orbi = cfg.setdefault("orbi", {})
     if not isinstance(orbi, dict):
         errors.append("[orbi] must be a table of Orbi settings")
@@ -288,11 +291,20 @@ TASK_CLASSES = {
 }
 
 
+def ax_binary(cfg: dict | None) -> str:
+    configured = (cfg or {}).get("ax", {}).get("bin", "ax")
+    if configured == "ax":
+        installed = state_home().absolute() / "bin" / "ax"
+        if installed.exists():
+            return str(installed)
+    return configured
+
+
 class Ax:
     def __init__(self, cfg: dict, *, start_new_session: bool = False):
         self.cfg = cfg
         self.start_new_session = start_new_session
-        self.base = [cfg["ax"]["bin"], "-a", cfg["ax"]["atespace"]]
+        self.base = [ax_binary(cfg), "-a", cfg["ax"]["atespace"]]
         if cfg["ax"].get("context"):
             self.base += ["--context", cfg["ax"]["context"]]
 
@@ -389,40 +401,50 @@ class Report:
 
 # ---- commands --------------------------------------------------------------
 
+def ax_version(ax_bin: str, pinned: str) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run([ax_bin, "version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"could not run `ax version`: {exc}"
+    line = proc.stdout.strip().partition("\n")[0]
+    match = re.match(r"ax version (\S+)(?:\s|$)", line)
+    version = match[1] if match else ""
+    source = re.fullmatch(r"dev\+([0-9a-f]{12})(-dirty)?", version)
+    if proc.returncode != 0:
+        error = proc.stderr.strip().partition("\n")[0] or line or "no output"
+        return False, f"`ax version` exited {proc.returncode}: {error}"
+    if source and source[2]:
+        return False, f"-dirty build cannot verify a clean checkout: {line}"
+    if source and source[1] != pinned:
+        return False, f"different commit: CLI {source[1]}, expected {pinned}"
+    if source:
+        return True, line
+    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+        return False, f"release build cannot be compared with a commit pin: {line}"
+    return False, f"`ax version` did not report a comparable revision: {line or 'no output'}"
+
+
+def check_ax_cluster(report: Report, result: tuple[int, str, str]) -> bool:
+    code, out, err = result
+    detail = (err or out).strip().splitlines()
+    return report.check("ax-cluster", code == 0, "control plane reachable" if code == 0 else
+                        detail[-1] if detail else f"ax get tasks exited {code}",
+                        "start it with `ax local start` or select a cluster with `ax ctx`; "
+                        "`ax local status` shows which layer is down")
+
+
 def host_checks(report: Report, cfg: dict | None, versions: dict, cluster: bool) -> None:
     report.check("python", sys.version_info >= (3, 11), sys.version.split()[0],
                  "ax-orbi needs Python 3.11 or later")
-    ax_bin = (cfg or {}).get("ax", {}).get("bin", "ax")
+    ax_bin = ax_binary(cfg)
     found = shutil.which(ax_bin)
     report.check("ax", bool(found), found or f"{ax_bin} not found on PATH",
                  f"build the ax CLI from {versions['ax']['repo']} at {versions['ax']['ref'][:12]} "
                  "(docs/SETUP.md) and add it to PATH")
     if found:
         pinned = versions["ax"]["ref"][:12]
-        verified = None
-        try:
-            proc = subprocess.run([ax_bin, "version"], capture_output=True, text=True, timeout=30)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            detail = f"could not run `ax version`: {exc}"
-        else:
-            line = proc.stdout.strip().partition("\n")[0]
-            match = re.match(r"ax version (\S+)(?:\s|$)", line)
-            version = match[1] if match else ""
-            source = re.fullmatch(r"dev\+([0-9a-f]{12})(-dirty)?", version)
-            if proc.returncode != 0:
-                error = proc.stderr.strip().partition("\n")[0] or line or "no output"
-                detail = f"`ax version` exited {proc.returncode}: {error}"
-            elif source and source[2]:
-                detail = f"-dirty build cannot verify a clean checkout: {line}"
-            elif source and source[1] != pinned:
-                detail = f"different commit: CLI {source[1]}, expected {pinned}"
-            elif source:
-                verified, detail = True, line
-            elif re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
-                detail = f"release build cannot be compared with a commit pin: {line}"
-            else:
-                detail = f"`ax version` did not report a comparable revision: {line or 'no output'}"
-        report.check("ax-version", verified, detail,
+        verified, detail = ax_version(found, pinned)
+        report.check("ax-version", verified or None, detail,
                      f"tested with google/ax {pinned}; the CLI, ax-server and the runner in the "
                      "image must come from the same commit")
     report.check("ax-server", None,
@@ -432,13 +454,7 @@ def host_checks(report: Report, cfg: dict | None, versions: dict, cluster: bool)
     report.check("image-pinned", True, cfg["image"]["ref"])
     if not cluster or not found:
         return
-    ax = Ax(cfg)
-    code, out, err = ax.run("get", "tasks", timeout=60)
-    report.check("ax-cluster", code == 0,
-                 "control plane reachable" if code == 0 else (err or out).strip().splitlines()[-1:][0]
-                 if (err or out).strip() else f"ax get tasks exited {code}",
-                 "start it with `ax local start` or select a cluster with `ax ctx`; "
-                 "`ax local status` shows which layer is down")
+    check_ax_cluster(report, Ax(cfg).run("get", "tasks", timeout=60))
     kubectl = shutil.which("kubectl") or shutil.which(str(Path.home() / ".ax/bin/kubectl"))
     secrets = [("github", cfg["credentials"]["github"]["secret"])]
     if cfg.get("model"):
@@ -506,41 +522,72 @@ def pins_id(versions: dict) -> str:
     return hashlib.sha256(blob + files).hexdigest()[:12]
 
 
-def cmd_build(args, report: Report) -> int:
+def run_host_step(report: Report, step: str, argv: list[str], *, timeout: int, fix: str,
+                  cwd: Path | None = None, env: dict | None = None) -> bool:
+    try:
+        with subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
+                              stdout=sys.stderr if report.as_json else None) as proc:
+            try:
+                code = proc.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                # Make, Go and Git can start children that outlive the parent command.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                raise
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return report.check(step, False, str(exc), fix)
+    if code:
+        return report.check(step, False, f"{' '.join(argv[:2])} exited {code}; see output above", fix)
+    return True
+
+
+def build_image(report: Report, repository: str, engine: str | None, push: bool) -> dict:
     versions = load_versions()
-    engine = args.engine or shutil.which("docker") and "docker" or shutil.which("podman") and "podman"
+    engine = engine or shutil.which("docker") and "docker" or shutil.which("podman") and "podman"
     if not engine:
         report.check("container-engine", False, "neither docker nor podman found")
-        return report.finish(EXIT_FAILED)
-    tag = f"{args.repository}:{pins_id(versions)}"
+        return {}
+    tag = f"{repository}:{pins_id(versions)}"
     cmd = [engine, "build", "-f", str(ROOT / "image" / "Dockerfile"), "-t", tag]
     for key, value in build_args(versions).items():
         cmd += ["--build-arg", f"{key}={value}"]
     cmd.append(str(ROOT / "image"))
     report.say(f"building {tag}")
-    out = sys.stderr if report.as_json else None
-    if subprocess.run(cmd, stdout=out).returncode != 0:
-        report.check("build", False, "image build failed; the error is above")
-        return report.finish(EXIT_FAILED)
+    if not run_host_step(report, "build", cmd, timeout=3600,
+                         fix="check that the container engine is running and can pull the pinned base images"):
+        return {}
     report.check("build", True, tag)
     ref = None
-    if args.push:
-        push = [engine, "push", tag]
+    if push:
+        push_cmd = [engine, "push", tag]
         if engine == "podman" and re.match(r"^(localhost|127\.0\.0\.1)(:\d+)?/", tag):
-            push.insert(2, "--tls-verify=false")
-        if subprocess.run(push, stdout=out).returncode != 0:
-            report.check("push", False, f"could not push {tag}",
-                         "check the registry address and that you are logged in to it")
-            return report.finish(EXIT_FAILED)
-        proc = subprocess.run([engine, "image", "inspect", "--format", "{{json .RepoDigests}}", tag],
-                              capture_output=True, text=True)
-        digests = json.loads(proc.stdout or "[]") if proc.returncode == 0 else []
-        ref = next((d for d in digests if d.startswith(args.repository + "@")), None)
-        if not report.check("push", bool(ref), ref or "pushed, but no digest was reported",
-                            f"resolve it with `{engine} buildx imagetools inspect {tag}`"):
-            return report.finish(EXIT_FAILED, tag=tag)
-        report.say(f'\nset this in your deployment config:\n\n[image]\nref = "{ref}"')
-    return report.finish(EXIT_OK, tag=tag, ref=ref)
+            push_cmd.insert(2, "--tls-verify=false")
+        if not run_host_step(report, "push", push_cmd, timeout=3600,
+                             fix="check the registry address and that you are logged in to it"):
+            return {}
+        fix = f"resolve it with `{engine} buildx imagetools inspect {tag}`"
+        try:
+            proc = subprocess.run([engine, "image", "inspect", "--format", "{{json .RepoDigests}}", tag],
+                                  capture_output=True, text=True, timeout=60, check=True)
+            digests = json.loads(proc.stdout or "null")
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            report.check("push", False, f"pushed, but could not read the digest: {exc}", fix)
+            return {"tag": tag}
+        if isinstance(digests, list):
+            ref = next((d for d in digests if isinstance(d, str) and d.startswith(repository + "@")
+                        and DIGEST_RE.fullmatch(d)), None)
+        if not report.check("push", bool(ref), ref or "pushed, but no digest was reported", fix):
+            return {"tag": tag}
+    return {"tag": tag, "ref": ref}
+
+
+def cmd_build(args, report: Report) -> int:
+    image = build_image(report, args.repository, args.engine, args.push)
+    if image.get("ref"):
+        report.say(f'\nset this in your deployment config:\n\n[image]\nref = "{image["ref"]}"')
+    return report.finish(EXIT_OK if report.ok else EXIT_FAILED, **image)
 
 
 def cmd_render(args, report: Report) -> int:
@@ -872,11 +919,93 @@ def fleet_entries(fleet: Path, *, include_config: bool = False) -> list[dict]:
     return entries
 
 
-def fleet_entry(fleet: Path, name: str) -> dict | None:
-    matches = [entry for entry in fleet_entries(fleet) if entry["name"] == name]
+def fleet_entry(fleet: Path, name: str, *, include_config: bool = False) -> dict | None:
+    matches = [entry for entry in fleet_entries(fleet, include_config=include_config) if entry["name"] == name]
     if len(matches) > 1:
         raise ConfigError(matches[0]["configError"])
     return matches[0] if matches else None
+
+
+def checkout_ax(report: Report, source: Path, pin: dict) -> bool:
+    if not shutil.which("git"):
+        return report.check("ax-source", False, "git not found on PATH", "install Git and retry enable")
+    source.parent.mkdir(parents=True, exist_ok=True)
+    fix = f"check access to {pin['repo']} at {pin['ref']} (docs/SETUP.md)"
+    if source.exists():
+        repair = f"move {source} aside and retry enable"
+        try:
+            top = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=source,
+                                 capture_output=True, text=True, timeout=30)
+            # Git also succeeds inside subdirectories of an enclosing checkout.
+            if top.returncode or Path(top.stdout.strip()) != source.resolve():
+                return report.check("ax-source", False, f"{source} is not an AX checkout", repair)
+            status = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=source,
+                                    capture_output=True, text=True, timeout=30, check=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return report.check("ax-source", False, str(exc), repair)
+        if status.stdout:
+            return report.check("ax-source", False, f"{source} has local changes", repair)
+        ready = run_host_step(report, "ax-source", ["git", "fetch", "--", pin["repo"], pin["ref"]],
+                              cwd=source, timeout=300, fix=fix)
+    else:
+        ready = run_host_step(report, "ax-source", ["git", "clone", "--no-checkout", "--",
+                                                    pin["repo"], str(source)],
+                              cwd=source.parent, timeout=300, fix=fix)
+    return ready and run_host_step(report, "ax-source", ["git", "checkout", "--detach", pin["ref"]],
+                                   cwd=source, timeout=300, fix=fix)
+
+
+def prepare_enable(report: Report, cfg: dict, versions: dict) -> bool:
+    state = state_home().absolute()
+    source = state / "ax-source"
+    pin = versions["ax"]
+    pinned = pin["ref"][:12]
+    ax_bin = ax_binary(cfg)
+    found = shutil.which(ax_bin)
+    verified, detail = ax_version(found, pinned) if found else (False, f"{ax_bin} not found or not executable")
+    go_env = dict(os.environ, GOTOOLCHAIN="auto")
+    if verified:
+        report.check("ax-install", True, f"{found} matches {pinned}; skipped build")
+    else:
+        if cfg["ax"]["bin"] != "ax":
+            return report.check("ax-install", False, detail,
+                                f"build your configured AX command at {pinned}, or set [ax] bin = \"ax\" "
+                                "to let enable install it (docs/SETUP.md)")
+        if not shutil.which("go"):
+            return report.check("ax-install", False, "go not found on PATH", "install Go and retry enable (docs/SETUP.md)")
+        if not checkout_ax(report, source, pin):
+            return False
+        binary = state / "bin" / "ax"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        fix = f"build AX from a clean checkout at {pinned}; see docs/SETUP.md"
+        if not run_host_step(report, "ax-install", ["go", "build", "-o", str(binary), "./cmd/ax"],
+                             cwd=source, env=go_env, timeout=3600, fix=fix):
+            return False
+        built, detail = ax_version(str(binary), pinned)
+        if not built:
+            return report.check("ax-install", False, detail, fix)
+        report.check("ax-install", True, f"built {binary} at {pinned}")
+
+    ax = Ax(cfg)
+    cluster = ax.run("get", "tasks", timeout=60)
+    if cluster[0] == 0:
+        report.check("ax-local", True, "control plane already reachable; skipped cluster startup")
+    else:
+        if not cfg["ax"]["local"]:
+            return check_ax_cluster(report, cluster)
+        if verified and not checkout_ax(report, source, pin):
+            return False
+        if not run_host_step(report, "ax-local", ["make", "build-local-cluster", "CONTAINER_CLI=docker"],
+                             cwd=source, env=go_env, timeout=3600,
+                             fix="check the local cluster prerequisites and Docker (docs/SETUP.md)"):
+            return False
+        cluster = ax.run("get", "tasks", timeout=60)
+        if cluster[0] != 0:
+            return check_ax_cluster(report, cluster)
+        report.check("ax-local", True, "started the local AX cluster")
+
+    host_checks(report, cfg, versions, cluster=True)
+    return report.ok
 
 
 def cmd_enable(args, report: Report) -> int:
@@ -884,26 +1013,41 @@ def cmd_enable(args, report: Report) -> int:
     try:
         if args.config is not None:
             config = args.config.absolute()
-            name = load_fleet_config(config)["name"]
+            cfg = load_fleet_config(config)
+            name = cfg["name"]
             entry = fleet_entry(fleet, name)
             if entry is not None and not Path(entry["configPath"]).samefile(config):
                 raise ConfigError(f"deployment {name!r} is already registered at {entry['configPath']}")
-            if entry is None:
-                fleet.mkdir(parents=True, exist_ok=True)
-                link = fleet / f"{name}.toml"
-                try:
-                    link.symlink_to(config)
-                except FileExistsError:
-                    raise ConfigError(f"cannot register {name!r}: {link} already exists") from None
         else:
             name = args.name
-            entry = fleet_entry(fleet, name)
+            entry = fleet_entry(fleet, name, include_config=True)
             if entry is None:
                 raise ConfigError(f"no fleet config named {name!r} in {fleet}; register it with enable --config PATH")
             if "configError" in entry:
                 raise ConfigError(entry["configError"])
+            cfg = entry["config"]
+
+        if args.build_image:
+            image = build_image(report, DEFAULT_IMAGE_REPOSITORY, engine=None, push=True)
+            report.data.update(image)
+            if not report.ok:
+                return report.finish(EXIT_FAILED)
+            if image["ref"] != cfg["image"]["ref"]:
+                report.check("image-ref", False, "pushed digest differs from image.ref",
+                             f'set this in your deployment config and retry:\n\n[image]\nref = "{image["ref"]}"')
+                return report.finish(EXIT_FAILED)
+        if not args.no_install and not prepare_enable(report, cfg, load_versions()):
+            return report.finish(EXIT_FAILED)
+
+        if args.config is not None and entry is None:
+            fleet.mkdir(parents=True, exist_ok=True)
+            link = fleet / f"{name}.toml"
+            try:
+                link.symlink_to(config)
+            except FileExistsError:
+                raise ConfigError(f"cannot register {name!r}: {link} already exists") from None
         write_desired(desired_path(name), "enabled", "")
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         report.check("enable", False, str(exc))
         return report.finish(EXIT_FAILED)
     report.check("enable", True, f"{name} enabled")
@@ -1278,7 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("check", parents=[common], help="prerequisites, pins and config")
     p.add_argument("--offline", action="store_true", help="skip the checks that need the cluster")
     p = sub.add_parser("build", parents=[common], help="build the task image from versions.toml")
-    p.add_argument("--repository", default="localhost:5001/ax-orbi",
+    p.add_argument("--repository", default=DEFAULT_IMAGE_REPOSITORY,
                    help="image repository (default: localhost:5001/ax-orbi, the AX local registry)")
     p.add_argument("--push", action="store_true", help="push and print the digest reference")
     p.add_argument("--engine", choices=["docker", "podman"])
@@ -1308,7 +1452,9 @@ def build_parser() -> argparse.ArgumentParser:
     fleet = argparse.ArgumentParser(add_help=False)
     fleet.add_argument("--fleet", type=Path, help="fleet config directory (overrides AX_ORBI_FLEET)")
     fleet.add_argument("--json", action="store_true", help="print one JSON object")
-    p = sub.add_parser("enable", parents=[fleet], help="enable or register a fleet deployment")
+    p = sub.add_parser("enable", parents=[fleet], help="prepare the host and enable a fleet deployment")
+    p.add_argument("--no-install", action="store_true", help="skip AX installation, cluster startup and host checks")
+    p.add_argument("--build-image", action="store_true", help="build and push the task image before enabling")
     target = p.add_mutually_exclusive_group(required=True)
     target.add_argument("name", nargs="?", metavar="NAME")
     target.add_argument("--config", "-c", type=Path, metavar="PATH", help="register a deployment config")
