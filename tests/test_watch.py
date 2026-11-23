@@ -410,13 +410,478 @@ class WatchTests(FleetTestCase):
         state["nextActionAt"] = "2000-01-01T00:00:00+00:00"
         self.watch_path().write_text(json.dumps(state))
 
-    def test_paused_deployment_is_left_alone(self):
+    def configure_watch(self, content):
+        config = self.fleet / "demo.toml"
+        config.write_text(config.read_text() + "[watch]\n" + content)
+        return config
+
+    def configure_notify(self, exit_code=0):
+        output = self.root / "notifications.jsonl"
+        script = self.root / "notify.py"
+        script.write_text(
+            "import json, os, sys\n"
+            "data = json.load(sys.stdin)\n"
+            "assert data['deployment'] == os.environ['AX_ORBI_DEPLOYMENT']\n"
+            "assert data['question']['id'] == os.environ['AX_ORBI_QUESTION_ID']\n"
+            "with open(sys.argv[1], 'a') as log:\n"
+            "    print(json.dumps(data), file=log)\n"
+            f"sys.exit({exit_code})\n"
+        )
+        config = self.configure_watch(f'notify_command = {json.dumps(["python3", str(script), str(output)])}\n')
+        return config, output
+
+    def assert_backoff(self, seconds):
+        state = self.watch_state()
+        delay = (datetime.fromisoformat(state["nextActionAt"]) - datetime.fromisoformat(state["at"])).total_seconds()
+        self.assertAlmostEqual(delay, seconds, delta=1)
+        return state
+
+    def test_failed_ticks_back_off_then_ask_once(self):
         sb = self.deployment()
+        _, output = self.configure_notify()
+        sb.set_mode("fail")
+        self.reach_tick()
+        for attempt, delay in enumerate((60, 300, 900, 1800), 1):
+            run_id = self.watch_state()["pendingTick"]["id"]
+            sb.wait_status(run_id, "failed")
+            self.watch_once()
+            state = self.assert_backoff(delay)
+            self.assertEqual((state["cause"], state["attempts"]), ("tick:failed", attempt))
+            self.assertEqual(state["phase"], "repairing" if attempt < 3 else "needs-owner")
+            self.watch_once()  # No extra tick or notification before the deadline.
+            self.assertEqual(len(self.requests(sb)), attempt)
+            self.assertEqual(self.watch_state()["attempts"], attempt)
+            if attempt < 4:
+                self.make_due()
+                self.watch_once()
+        question = state["question"]
+        self.assertRegex(question["id"], r"^[a-f0-9]{12}$")
+        self.assertEqual(question["cause"], "tick:failed")
+        self.assertTrue(question["text"])
+        self.assertTrue(question["options"])
+        self.assertIsNotNone(question["notifiedAt"])
+        for _ in range(5):
+            self.watch_once()
+        notice, = map(json.loads, output.read_text().splitlines())
+        self.assertEqual(notice["question"]["id"], question["id"])
+        self.assertEqual(len(self.requests(sb)), 4)
+
+    def events(self):
+        return [json.loads(line) for line in self.watch_path().with_name("events.jsonl").read_text().splitlines()]
+
+    def set_task_phase(self, sb, phase):
+        path = sb.tmp / "ax-state.json"
+        fake_state = json.loads(path.read_text())
+        path.write_text(json.dumps(dict(fake_state, phase=phase)))
+
+    def fail_ticks(self, sb, count):
+        sb.set_mode("fail")
+        self.reach_tick()
+        for index in range(count):
+            if index:
+                self.make_due()
+                self.watch_once()
+            sb.wait_status(self.watch_state()["pendingTick"]["id"], "failed")
+            self.watch_once()
+
+    def failed_setup_status(self, sb):
+        status = sb.status()
+        status["prepare"]["ok"] = False
+        status["prepare"]["checks"].extend([
+            dict(name="project-setup", ok=False, detail="setup recipe failed"),
+            dict(name="another-check", ok=False, detail="another check failed"),
+        ])
+        return status
+
+    def test_dead_supervisor_is_restarted(self):
+        sb = self.deployment()
+        self.make_ready(sb)
+        pid = json.loads((sb.tmp / "ax-state.json").read_text())["pid"]
+        os.kill(pid, signal.SIGKILL)
+        wait_until(lambda: not sb.status()["supervisorAlive"], what="supervisor to die")
+        state = self.watch_state()
+        state["startingSince"] = "2000-01-01T00:00:00+00:00"
+        self.watch_path().write_text(json.dumps(state))
+        stale = sb.status()
+        stale["health"]["currentRun"] = "stale"
+        stale["counts"] = {"running": 1}
+        self.env["FAKE_AX_STATUS"] = json.dumps(stale)
+        self.watch_once()
+        del self.env["FAKE_AX_STATUS"]
+        self.assertEqual(self.watch_state()["phase"], "repairing")
+        self.assertEqual(self.watch_state()["cause"], "agent:down")
+        self.watch_once()
+        sb.wait_ready()
+        self.reach_tick()
+        sb.wait_status(self.watch_state()["pendingTick"]["id"], "succeeded")
+        changes = [args[0] for args in self.calls(sb) if args[0] in ("suspend", "resume")]
+        self.assertEqual(changes, ["resume", "suspend", "resume"])
+        self.assertEqual(self.watch_state()["attempts"], 0)
+        self.assertEqual(self.watch_state()["desired"], "enabled")
+        repair, = self.events()
+        self.assertEqual((repair["cause"], repair["action"], repair["attempt"]), ("agent:down", "repair", 1))
+
+    def test_recovery_closes_the_question(self):
+        sb = self.deployment()
+        self.fail_ticks(sb, 4)
+        question = self.watch_state()["question"]
+        sb.set_mode("ok")
+        self.make_due()
+        self.watch_once()
+        sb.wait_status(self.watch_state()["pendingTick"]["id"], "succeeded")
+        self.watch_once()
+        state = self.watch_state()
+        self.assertIsNone(state["question"])
+        self.assertIsNone(state["cause"])
+        self.assertEqual((state["attempts"], state["phase"], state["lastTick"]["status"]), (0, "idle", "succeeded"))
+        opened, closed = self.events()
+        self.assertEqual((opened["cause"], opened["action"]), (question["cause"], "question-opened"))
+        self.assertEqual((closed["cause"], closed["action"]), (question["cause"], "question-closed"))
+
+    def test_interrupted_tick_does_not_reset_failed_tick_backoff(self):
+        sb = self.deployment()
+        self.fail_ticks(sb, 1)
+        sb.set_mode("hang")
+        self.make_due()
+        self.watch_once()
+        run_id = self.watch_state()["pendingTick"]["id"]
+        sb.wait_status(run_id, "running")
+        self.fake_ax(sb, "suspend", "task", "orbi-demo")
+        self.watch_once()
+        sb.wait_ready()
+        self.watch_once()
+        state = self.assert_backoff(60)
+        self.assertEqual(state["lastTick"]["status"], "interrupted")
+        self.assertEqual((state["cause"], state["attempts"], state["phase"]), ("tick:failed", 1, "repairing"))
+
+    def test_changed_cause_resets_the_count(self):
+        sb = self.deployment()
+        self.fail_ticks(sb, 2)
+        self.assertEqual(self.watch_state()["attempts"], 2)
+        self.env["FAKE_AX_FAIL_GET"] = "1"
+        self.watch_once()
+        state = self.assert_backoff(60)
+        self.assertEqual((state["cause"], state["attempts"], state["phase"]), ("ax:unreachable", 1, "waiting"))
+
+    def test_failed_task_asks_and_is_not_deleted(self):
+        sb = self.deployment()
+        self.watch_once()  # Create the task before injecting a failed state.
+        self.set_task_phase(sb, "Failed")
+        self.watch_once()
+        state = self.assert_backoff(900)
+        self.assertEqual((state["cause"], state["attempts"], state["phase"]), ("task:Failed", 1, "needs-owner"))
+        self.assertIn("unpushed work", state["question"]["text"])
+        before = self.calls(sb)
+        self.watch_once()
+        self.assertEqual(self.calls(sb), before)
+        self.make_due()
+        self.watch_once()
+        self.assert_backoff(1800)
+        self.assertEqual(state["question"], self.watch_state()["question"])
+        self.set_task_phase(sb, "Queued")  # A failed task isn't verified until active and ready.
+        self.make_due()
+        self.watch_once()
+        self.assertEqual(state["question"], self.assert_backoff(1800)["question"])
+        self.assertFalse(any(args[0] == "delete" for args in self.calls(sb)))
+
+    def test_events_rotate_and_unrecognised_state_never_recreates(self):
+        sb = self.deployment()
+        self.configure_watch("recreate_failed = true\n")
+        self.watch_once()
+        log = self.watch_path().with_name("events.jsonl")
+        rotated = log.with_suffix(".jsonl.1")
+        old_events = (b'{"previousEvent":true}\n' * 50_000)  # More than 1 MiB.
+        log.write_bytes(old_events)
+        rotated.write_text("an older log")
+        self.set_task_phase(sb, "RequiresAction")
+        self.watch_once()
+        state = self.watch_state()
+        self.assertEqual((state["phase"], state["attempts"]), ("needs-owner", 1))
+        self.assertIn("unrecognised state 'RequiresAction'", state["question"]["text"])
+        self.assertFalse(any(args[0] == "delete" for args in self.calls(sb)))
+        self.assertEqual(rotated.read_bytes(), old_events)
+        event, = self.events()
+        self.assertEqual((event["cause"], event["action"]), ("task:RequiresAction", "question-opened"))
+        self.set_task_phase(sb, "Suspended")
+        self.make_due()
+        self.watch_once()
+        self.assertIsNone(self.watch_state()["question"])
+
+    def test_image_pin_mismatch_asks_without_restarting(self):
+        sb = self.deployment()
+        self.make_ready(sb)
+        status = sb.status()
+        status["prepare"]["image"]["ax_ref"] = "wrong-ref"
+        self.env["FAKE_AX_STATUS"] = json.dumps(status)
+        self.watch_once()
+        state = self.watch_state()
+        self.assertEqual((state["cause"], state["phase"], state["attempts"]), ("image-pins", "needs-owner", 1))
+        self.assertFalse(any(args[0] in ("delete", "suspend") for args in self.calls(sb)))
+        del self.env["FAKE_AX_STATUS"]
+        self.make_due()
+        self.reach_tick()
+        self.assertIsNone(self.watch_state()["question"])
+
+    def test_failed_task_is_recreated_only_when_allowed(self):
+        sb = self.deployment()
+        self.configure_watch("recreate_failed = true\n")
+        self.watch_once()
+        self.set_task_phase(sb, "Failed")
+        self.watch_once()
+        state = self.watch_state()
+        self.assertEqual((state["cause"], state["phase"]), ("task:Failed", "repairing"))
+        self.assertIsNone(state["question"])
+        self.reach_tick()
+        sb.wait_status(self.watch_state()["pendingTick"]["id"], "succeeded")
+        changes = [args for args in self.calls(sb) if args[0] in ("apply", "delete", "resume")]
+        self.assertEqual(changes, [["apply", "-f", "-"], ["delete", "task", "orbi-demo"],
+                                   ["delete", "workspace", "orbi-demo-ws"], ["delete", "gateway", "orbi-demo-gw"],
+                                   ["apply", "-f", "-"], ["resume", "task", "orbi-demo"]])
+        self.assertEqual(self.watch_state()["attempts"], 0)
+        self.assertEqual(json.loads(self.desired.read_text())["mode"], "enabled")
+
+    def test_partial_delete_does_not_apply_over_old_workspace(self):
+        sb = self.deployment()
+        self.configure_watch("recreate_failed = true\n")
+        self.watch_once()
+        self.set_task_phase(sb, "Failed")
+        self.wrap_ax(sb, 'if [ "$3 $4" = "delete workspace" ]; then echo "workspace busy" >&2; exit 1; fi\n')
+        for attempt, delay in enumerate((60, 300, 900, 1800), 1):
+            if attempt > 1:
+                self.make_due()
+            self.watch_once()
+            state = self.assert_backoff(delay)
+            self.assertEqual((state["cause"], state["attempts"]), ("task:Failed", attempt))
+        self.assertEqual(state["phase"], "needs-owner")
+        changes = [args[0] for args in self.calls(sb) if args[0] in ("apply", "delete")]
+        self.assertEqual(changes, ["apply", "delete", "delete", "delete", "delete"])
+        repairs = [event for event in self.events() if event["action"] == "repair"]
+        self.assertEqual([event["result"] for event in repairs], ["workspace busy", "workspace busy"])
+
+        self.wrap_ax(sb)
+        self.command("stop", "--delete", "--yes-delete-state", "-c", str(self.fleet / "demo.toml"))
+        self.command("resume", "demo")
+        self.reach_tick()
+        self.assertIsNone(self.watch_state()["question"])
+
+    def test_failing_notify_command_does_not_stop_the_pass(self):
+        sb = self.deployment()
+        _, output = self.configure_notify(exit_code=1)
+        self.watch_once()
+        self.set_task_phase(sb, "Failed")
+        for _ in range(6):
+            self.watch_once()
+        attempts = [event for event in self.events() if event["action"] == "notify"]
+        self.assertEqual([(event["attempt"], event["result"]) for event in attempts],
+                         [(1, "exited 1"), (2, "exited 1"), (3, "exited 1")])
+        self.assertEqual(len(output.read_text().splitlines()), 3)
+        self.assertIsNone(self.watch_state()["question"]["notifiedAt"])
+
+    def test_duplicate_configs_retry_notify_only_on_later_passes(self):
+        self.deployment()
+        config, output = self.configure_notify(exit_code=1)
+        self.watch_once()
+        (self.fleet / "duplicate.toml").write_text(config.read_text())
+        self.watch_once()
+        self.assertEqual(self.watch_state()["cause"], "config")
+        self.assertEqual(len(output.read_text().splitlines()), 1)
+        self.watch_once()
+        self.assertEqual(len(output.read_text().splitlines()), 2)
+
+    def test_timed_out_notify_stops_its_worker(self):
+        sb = self.deployment()
+        _, worker = self.configure_notify()
+        (self.root / "notify.py").write_text(
+            "import subprocess, sys\n"
+            "from pathlib import Path\n"
+            "child = subprocess.Popen(['sleep', '8'])\n"
+            "Path(sys.argv[1]).write_text(str(child.pid))\n"
+            "child.wait(timeout=9)\n"
+        )
+        self.watch_once()
+        self.set_task_phase(sb, "Failed")
+        communicate = subprocess.Popen.communicate
+
+        def shorten_notify(proc, input=None, timeout=None):
+            if proc.args[:2] == ["python3", str(self.root / "notify.py")]:
+                self.assertEqual(timeout, 30)
+                timeout = 1
+            return communicate(proc, input=input, timeout=timeout)
+
+        with patch.dict(os.environ, self.env), patch.object(subprocess.Popen, "communicate", shorten_notify):
+            self.assertEqual(cli.main(["watch", "--once"]), 0)
+        self.assertEqual(self.events()[-1]["result"], "timed out after 30s")
+        self.assertIsNone(self.watch_state()["question"]["notifiedAt"])
+        stat_path = Path("/proc") / worker.read_text() / "stat"
+
+        def stopped():
+            try:
+                return stat_path.read_text().rsplit(") ", 1)[1].startswith("Z ")
+            except FileNotFoundError:
+                return True
+
+        wait_until(stopped, timeout=1, what="notify worker to stop")
+
+    def test_no_repair_while_a_tick_runs(self):
+        sb = self.deployment()
+        sb.set_mode("hang")
+        self.reach_tick()
+        run_id = self.watch_state()["pendingTick"]["id"]
+        sb.wait_status(run_id, "running")
+        status = self.failed_setup_status(sb)
+        self.assertEqual(status["health"]["currentRun"], run_id)
+        self.env["FAKE_AX_STATUS"] = json.dumps(status)
+        self.watch_once()
+        self.assertFalse(any(args[0] == "suspend" for args in self.calls(sb)))
+        state = self.watch_state()
+        self.assertEqual((state["cause"], state["attempts"]), ("sandbox:project-setup", 1))
+        self.assertIsNone(state["nextActionAt"])
+
+    def test_failed_resume_is_bounded_during_a_repair(self):
+        sb = self.deployment()
+        self.make_ready(sb)
+        self.env["FAKE_AX_STATUS"] = json.dumps(self.failed_setup_status(sb))
+        self.watch_once()  # Suspend successfully, but the restore fails on the next pass.
+        self.wrap_ax(sb, 'if [ "$3" = resume ]; then echo "restore unavailable" >&2; exit 1; fi\n')
+        self.watch_once()
+        self.assertIn("restore unavailable", self.watch_state()["detail"])
+        self.watch_once()
+        self.assertEqual(self.watch_state()["attempts"], 1)
+        for delay in (300, 900, 1800):
+            self.make_due()
+            self.watch_once()
+            self.assert_backoff(delay)
+        state = self.watch_state()
+        self.assertEqual((state["cause"], state["phase"]), ("sandbox:project-setup", "needs-owner"))
+        self.assertEqual([event["action"] for event in self.events()], ["repair", "repair", "question-opened"])
+
+    def test_sandbox_repair_is_bounded_across_restarts(self):
+        sb = self.deployment()
+        self.make_ready(sb)
+        self.env["FAKE_AX_STATUS"] = json.dumps(self.failed_setup_status(sb))
+        for attempt, delay in enumerate((60, 300), 1):
+            self.watch_once()
+            state = self.assert_backoff(delay)
+            self.assertEqual((state["cause"], state["attempts"], state["phase"]),
+                             ("sandbox:project-setup", attempt, "repairing"))
+            self.watch_once()  # Resume the task on a separate pass, without losing the cause.
+            sb.wait_ready()
+            self.watch_once()
+            self.assertEqual(self.watch_state()["attempts"], attempt)
+            self.make_due()
+        self.watch_once()
+        self.assertEqual(self.assert_backoff(900)["phase"], "needs-owner")
+        self.make_due()
+        self.watch_once()
+        self.assert_backoff(1800)
+        self.assertEqual(sum(args[0] == "suspend" for args in self.calls(sb)), 2)
+        self.assertEqual([event["action"] for event in self.events()], ["repair", "repair", "question-opened"])
+        del self.env["FAKE_AX_STATUS"]
+        self.make_due()
+        self.reach_tick()
+        self.assertIsNone(self.watch_state()["question"])
+
+    def test_fresh_start_is_not_treated_as_down(self):
+        sb = self.deployment()
+        self.watch_once()
+        self.watch_once()
+        since = self.watch_state()["startingSince"]
+        self.assertIsNotNone(since)
+        self.env["FAKE_AX_FAIL_SSH"] = "1"
+        for _ in range(3):
+            self.watch_once()
+            state = self.watch_state()
+            self.assertEqual((state["phase"], state["startingSince"], state["cause"]), ("starting", since, None))
+        self.assertFalse(any(args[0] == "suspend" for args in self.calls(sb)))
+
+    def test_unreachable_ax_stays_waiting_until_the_question(self):
+        sb = self.deployment()
+        self.env["FAKE_AX_FAIL_GET"] = "1"
+        for attempt, delay in enumerate((60, 300, 900), 1):
+            self.watch_once()
+            state = self.assert_backoff(delay)
+            self.assertEqual(state["attempts"], attempt)
+            self.assertEqual(state["phase"], "waiting" if attempt < 3 else "needs-owner")
+            self.assertIn("next check at", state["detail"])
+            if attempt < 3:
+                self.make_due()
+        before = self.calls(sb)
+        self.watch_once()
+        self.assertEqual(self.calls(sb), before)
+        del self.env["FAKE_AX_FAIL_GET"]
+        self.make_due()
+        self.watch_once()
+        self.assertEqual((self.watch_state()["phase"], self.watch_state()["question"]), ("preparing", None))
+
+    def test_unloadable_config_asks_once(self):
+        sb = self.deployment()
+        config, output = self.configure_notify()
+        self.watch_once()  # Save the notification command while the config still loads.
+        valid = config.read_text()
+        config.write_text(valid + "tick_interval = 1\n")
+        before = self.calls(sb)
+        self.watch_once()
+        state = self.watch_state()
+        self.assertEqual((state["cause"], state["phase"]), ("config", "needs-owner"))
+        self.assertIn("watch.tick_interval", state["detail"])
+        config.write_text(valid + "tick_interval = [\n")  # The declared name survives a TOML syntax error.
+        self.watch_once()
+        self.assertEqual(self.watch_state()["question"], state["question"])
+        self.assertNotIn("watch.tick_interval", self.watch_state()["detail"])
+        notice, = map(json.loads, output.read_text().splitlines())
+        self.assertEqual(notice["question"]["id"], state["question"]["id"])
+        self.assertEqual(self.calls(sb), before)
+        config.write_text(valid)
+        self.watch_once()
+        self.assertIsNone(self.watch_state()["question"])
+        self.assertEqual(self.watch_state()["phase"], "resuming")
+
+        state = self.watch_state()
+        state["notifyCommand"] = "legacy non-list value"
+        self.watch_path().write_text(json.dumps(state))
+        config.write_text(valid + "tick_interval = 1\n")
+        self.watch_once()
+        self.assertEqual(self.watch_state()["phase"], "needs-owner")
+        self.assertEqual(self.watch_state()["notifyAttempts"], 0)
+
+    def test_status_shows_the_question(self):
+        sb = self.deployment()
+        self.watch_once()
+        self.set_task_phase(sb, "Failed")
+        self.watch_once()
+        question = self.watch_state()["question"]
+        self.assertEqual(self.status()["watch"]["question"], question)
+        proc = self.process("status", "demo")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("The sandbox for demo is in AX state Failed", proc.stdout)
+        self.assertIn(question["text"], proc.stdout)
+        self.assertEqual(len(question["options"]), 3)
+        for option in question["options"]:
+            self.assertIn(option["command"], proc.stdout)
+        recreate = question["options"][1]["command"]
+        # Actually follow the displayed recovery option against fake AX.
+        for command in recreate.split(" && "):
+            tool, *args = shlex.split(command)
+            self.assertEqual(tool, "ax-orbi")
+            self.command(*args)
+        self.make_due()
+        self.reach_tick()
+        sb.wait_status(self.watch_state()["pendingTick"]["id"], "succeeded")
+        self.assertIsNone(self.watch_state()["question"])
+
+    def test_paused_deployment_gets_no_repair_or_question(self):
+        sb = self.deployment()
+        _, output = self.configure_notify()
+        self.env["FAKE_AX_FAIL_GET"] = "1"
         self.command("pause", "demo", "--reason", "maintenance")
         before = self.desired.read_bytes()
         for _ in range(3):
             self.watch_once()
-        self.assertEqual(self.watch_state()["phase"], "paused")
+        state = self.watch_state()
+        self.assertEqual(state["phase"], "paused")
+        self.assertIsNone(state["question"])
+        self.assertIsNone(state["cause"])
+        self.assertFalse(output.exists())
         self.assertEqual(self.desired.read_bytes(), before)
         self.assertFalse((sb.tmp / "ax-calls.jsonl").exists())
 
@@ -533,7 +998,7 @@ class WatchTests(FleetTestCase):
         self.watch_once()
         state = self.watch_state()
         run_id = state["pendingTick"]["id"]
-        self.assertEqual(state["phase"], "blocked")
+        self.assertEqual(state["phase"], "waiting")
         self.assertIn("request lost", state["detail"])
         self.assertEqual(sb.ticks(), 0)
         self.wrap_ax(sb)
@@ -571,7 +1036,7 @@ class WatchTests(FleetTestCase):
         self.reach_tick()
         entries = {entry["name"]: entry for entry in self.command("status")["deployments"]}
         self.assertEqual(entries["broken"]["watch"]["phase"], "waiting")
-        self.assertEqual(entries["broken"]["watch"]["detail"], "Waiting for AX to answer")
+        self.assertRegex(entries["broken"]["watch"]["detail"], r"^Waiting for AX to answer; next check at \d\d:\d\d UTC$")
         run_id = entries["demo"]["watch"]["pendingTick"]["id"]
         good.wait_status(run_id, "succeeded")
         self.wrap_ax(broken)
@@ -637,7 +1102,7 @@ class WatchTests(FleetTestCase):
         self.env["FAKE_AX_STATUS"] = json.dumps(status)
         self.watch_once()
         state = self.watch_state()
-        self.assertEqual(state["phase"], "blocked")
+        self.assertEqual(state["phase"], "waiting")
         self.assertIsNone(state["startingSince"])
         self.assertEqual(self.requests(sb), [])
 
@@ -704,7 +1169,8 @@ class WatchTests(FleetTestCase):
         original = config.read_text()
         render_args = ("render", "--config", str(config))
         without = self.process(*render_args)
-        config.write_text(original + "[watch]\ntick_interval = 60\n")
+        config.write_text(original + '[watch]\ntick_interval = 60\nnotify_command = ["sh", "notify.sh"]\n'
+                          'recreate_failed = true\n')
         with_watch = self.process(*render_args)
         self.assertEqual(without.returncode, 0, without.stdout + without.stderr)
         self.assertEqual(with_watch.returncode, 0, with_watch.stdout + with_watch.stderr)
@@ -715,20 +1181,31 @@ class WatchTests(FleetTestCase):
                 proc = self.process(*render_args)
                 self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
                 self.assertIn("watch.tick_interval must be an integer of at least 60 seconds", proc.stdout)
+        for field, invalid, expected in (
+            ("notify_command", '"script"', "a non-empty list of strings"),
+            ("notify_command", "[]", "a non-empty list of strings"),
+            ("notify_command", '["sh", 1]', "a non-empty list of strings"),
+            ("recreate_failed", '"true"', "a boolean"),
+        ):
+            with self.subTest(field=field, invalid=invalid):
+                config.write_text(original + f"[watch]\n{field} = {invalid}\n")
+                proc = self.process(*render_args)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn(f"watch.{field} must be {expected}", proc.stdout)
 
     def test_config_error_keeps_identity_and_the_last_notify_command(self):
         sb = self.deployment()
         self.command("pause", "demo")
-        config = self.fleet / "demo.toml"
-        valid = config.read_text() + '[watch]\nnotify_command = ["never-run-this"]\n'
-        config.write_text(valid)
+        config, output = self.configure_notify()
+        valid = config.read_text()
+        command = ["python3", str(self.root / "notify.py"), str(output)]
         self.watch_once()
-        self.assertEqual(self.watch_state()["notifyCommand"], ["never-run-this"])
-        config.write_text(valid.replace('["never-run-this"]', "2026-11-23"))
+        self.assertEqual(self.watch_state()["notifyCommand"], command)
+        config.write_text(valid.replace(json.dumps(command), "2026-11-23"))
         self.watch_once()
         self.assertEqual(self.watch_state()["phase"], "config-error")
         self.assertIn("watch.notify_command", self.watch_state()["detail"])
-        self.assertEqual(self.watch_state()["notifyCommand"], ["never-run-this"])
+        self.assertEqual(self.watch_state()["notifyCommand"], command)
 
         config.write_text(valid + "tick_interval = 10\n")
         (self.fleet / "bad.toml").write_text("not valid TOML")
@@ -736,7 +1213,8 @@ class WatchTests(FleetTestCase):
         self.watch_once()
         entries = {entry["name"]: entry for entry in self.command("status")["deployments"]}
         self.assertEqual(entries["demo"]["watch"]["phase"], "config-error")
-        self.assertEqual(entries["demo"]["watch"]["notifyCommand"], ["never-run-this"])
+        self.assertEqual(entries["demo"]["watch"]["notifyCommand"], command)
+        self.assertFalse(output.exists())
         self.assertIn("configError", entries[None])
         self.assertNotIn("watch", entries[None])
         self.assertNotIn("watch", entries["unregistered"])

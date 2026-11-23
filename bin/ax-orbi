@@ -12,8 +12,8 @@
   ax-orbi enable    prepare the host and enable a fleet deployment; --config registers it
   ax-orbi pause     record that a deployment should stay paused
   ax-orbi resume    re-enable a paused deployment
-  ax-orbi status    list fleet deployments and their recorded modes and watch activity
-  ax-orbi watch     keep enabled fleet deployments ticking outside AX
+  ax-orbi status    list fleet modes, watch activity and open owner questions
+  ax-orbi watch     keep enabled deployments ticking, with bounded repairs outside AX
 
 Every command takes --json. The fleet commands take --fleet; the other
 commands take -c/--config (default ./ax-orbi.toml).
@@ -31,6 +31,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -42,6 +43,7 @@ import tomllib
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -68,6 +70,10 @@ class ConfigError(Exception):
 def load_versions(path: Path | None = None) -> dict:
     with open(path or os.environ.get("AX_ORBI_VERSIONS_TOML") or ROOT / "versions.toml", "rb") as fh:
         return tomllib.load(fh)
+
+
+def valid_notify_command(command: object) -> bool:
+    return isinstance(command, list) and bool(command) and all(isinstance(arg, str) for arg in command)
 
 
 def load_config(path: Path) -> dict:
@@ -155,11 +161,10 @@ def load_config(path: Path) -> dict:
         interval = watch.setdefault("tick_interval", 300)
         if type(interval) is not int or interval < 60:
             errors.append("watch.tick_interval must be an integer of at least 60 seconds")
-        if "notify_command" in watch:
-            try:
-                json.dumps(watch["notify_command"], allow_nan=False)
-            except (TypeError, ValueError):
-                errors.append("watch.notify_command must be a value that can be saved as JSON")
+        if "notify_command" in watch and not valid_notify_command(watch["notify_command"]):
+            errors.append("watch.notify_command must be a non-empty list of strings")
+        if not isinstance(watch.setdefault("recreate_failed", False), bool):
+            errors.append("watch.recreate_failed must be a boolean")
 
     if errors:
         raise ConfigError(f"{path}:\n  - " + "\n  - ".join(errors))
@@ -899,10 +904,20 @@ def fleet_entries(fleet: Path, *, include_config: bool = False) -> list[dict]:
         except Exception as exc:
             entry["configError"] = str(exc)
             # Preserve the declared identity even when another field is invalid.
+            cfg = {}
             try:
-                cfg = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-            except Exception:
-                cfg = {}
+                raw = path.read_text(encoding="utf-8") if path.is_file() else ""
+                cfg = tomllib.loads(raw)
+            except tomllib.TOMLDecodeError:
+                # Keep an unambiguous top-level name before a later syntax error.
+                declarations = list(re.finditer(r'''(?m)^[ \t]*(?:name|"name"|'name')[ \t]*=.*$''', raw))
+                if len(declarations) == 1:
+                    try:
+                        cfg = tomllib.loads(raw[:declarations[0].end()])
+                    except tomllib.TOMLDecodeError:
+                        pass
+            except (OSError, UnicodeError):
+                pass
         else:
             if include_config:
                 entry["config"] = cfg
@@ -1115,6 +1130,10 @@ def cmd_status(args, report: Report) -> int:
             if watch and watch.get("phase"):
                 age = f" ({entry['watchAgeSeconds']}s ago)" if "watchAgeSeconds" in entry else ""
                 report.say(f"  {watch['phase']}: {watch.get('detail', '')}{age}")
+                if question := watch.get("question"):
+                    report.say(f"  {question['text']}")
+                    for option in question["options"]:
+                        report.say(f"    {option['label']}: {option['command']}")
         if not deployments:
             if args.name is not None:
                 print(f"no fleet config named {args.name!r} in {fleet}; register it with enable --config PATH",
@@ -1129,19 +1148,239 @@ def cmd_status(args, report: Report) -> int:
     return report.finish(code, deployments=deployments)
 
 
-def watch_step(cfg: dict, state: dict, path: Path) -> tuple[str, str] | None:
+WATCH_WAITS = (60, 300, 900, 1800)
+
+
+def watch_enabled(path: Path, state: dict) -> bool:
+    # An operator can pause (including via stop) while the observation is in flight.
+    record = read_desired(path.with_name("desired.json"))
+    state["desired"] = record["mode"] if record is not None else None
+    return state["desired"] == "enabled"
+
+
+def watch_event(path: Path, state: dict, action: str, result: str, attempt: int) -> None:
+    events = path.with_name("events.jsonl")
+    line = json.dumps(dict(at=datetime.now(timezone.utc).isoformat(), cause=state["cause"],
+                           action=action, result=result, attempt=attempt)) + "\n"
+    try:
+        events.parent.mkdir(parents=True, exist_ok=True)
+        if events.exists() and events.stat().st_size + len(line.encode("utf-8")) > 1024 * 1024:
+            events.replace(events.with_suffix(".jsonl.1"))
+        with events.open("a", encoding="utf-8") as log:
+            log.write(line)
+    except OSError as exc:
+        print(f"Cannot write watch event for {state['deployment']}: {exc}", file=sys.stderr)
+
+
+def clear_watch_cause(path: Path, state: dict) -> None:
+    if state["cause"] is None:
+        return
+    if state["question"]:
+        watch_event(path, state, "question-closed", "ok", state["attempts"])
+    state.update(cause=None, attempts=0, nextActionAt=None, question=None, notifyAttempts=0)
+    state.pop("repairFollowup", None)
+
+
+def watch_question(entry: dict, cause: str, now: datetime, *, removal_incomplete: bool = False) -> dict:
+    name = entry["name"]
+    kind, _, check = cause.partition(":")
+    config = shlex.quote(entry["configPath"])
+    fleet = shlex.quote(str(Path(entry["configPath"]).parent))
+    pause = ("Leave it paused", f"ax-orbi pause --fleet {fleet} {name}")
+    if kind == "config":
+        text = f"The watch service cannot load the config for {name}; can you correct {entry['configPath']}?"
+        options = [("Edit the config", f"vi {config}"), ("Validate the config", f"ax-orbi render -c {config}")]
+    else:
+        cfg = entry["config"]
+        describe = ("Look at the AX task", shlex.join(Ax(cfg).base + ["describe", "task", names(cfg)["task"]]))
+        inspect = ("Inspect the sandbox and recent ticks", f"ax-orbi inspect -c {config}")
+        recover = ("Bring the sandbox back up", f"ax-orbi recover -c {config}")
+        registry, slash, image = cfg["image"]["ref"].split("@", 1)[0].rpartition("/")
+        build = shlex.join(["ax-orbi", "build", "--push", "--repository", registry + slash + image.split(":", 1)[0]])
+        questions = {
+            "ax": (f"AX still does not answer for {name}; can you check the control plane?", [describe]),
+            "agent": (f"The sandbox agent for {name} still does not start; can you inspect it?",
+                      [inspect, describe, recover]),
+            "sandbox": (f"Setup check {check!r} still fails for {name}; can you fix the project setup?", [inspect, recover]),
+            "tick": (f"Orbi ticks for {name} keep failing; can you inspect the run evidence?",
+                     [("Read recent tick logs", f"ax-orbi inspect --logs -c {config}")]),
+            "image-pins": (f"The image pins for {name} do not match; can you rebuild the image and configure it "
+                           "under a new deployment name?",
+                           [inspect, ("Build and push the pinned image", build), ("Edit the config", f"vi {config}")]),
+            "task": (f"The sandbox for {name} is in AX state {check}; recreate it only if you can lose "
+                     "/workspace, including unpushed work.",
+                     [describe, ("Recreate (deletes /workspace)", f"ax-orbi stop --delete --yes-delete-state -c {config}"
+                                 f" && ax-orbi resume --fleet {fleet} {name}")]),
+        }
+        text, options = questions[kind]
+        if kind == "task" and TASK_CLASSES.get(check) != "failed":
+            text = f"AX reports the unrecognised state {check!r} for {name}; can you check the task?"
+            options = [describe]
+        elif kind == "task" and removal_incomplete:
+            text = (f"AX could not finish removing the sandbox for {name} after state {check}; "
+                    "finish recreating it only if you can lose /workspace, including unpushed work.")
+            options[0] = ("Look at the AX workspace", shlex.join(Ax(cfg).base + [
+                "describe", "workspace", names(cfg)["workspace"],
+            ]))
+    return dict(id=hashlib.sha256(f"{name}:{cause}".encode()).hexdigest()[:12], cause=cause,
+                text=text, options=[dict(label=label, command=command) for label, command in [*options, pause]],
+                openedAt=now.isoformat(), notifiedAt=None)
+
+
+def watch_wait(state: dict, phase: str, detail: str) -> tuple[str, str]:
+    deadline = datetime.fromisoformat(state["nextActionAt"])
+    return phase, f"{detail}; next check at {deadline:%H:%M UTC}"
+
+
+def watch_failure(entry: dict, state: dict, path: Path, now: datetime, cause: str, detail: str,
+                  *, repair: Callable[[], str | None] | None = None, ask_now: bool = False,
+                  current_run: str | None = None) -> tuple[str, str]:
+    if state["cause"] != cause:
+        clear_watch_cause(path, state)
+        state.update(cause=cause, attempts=1, nextActionAt=None)
+    question = state["question"]
+    deadline = state["nextActionAt"]
+    due = not deadline or now >= datetime.fromisoformat(deadline)
+    # A live tick can defer the changing step, but not a due owner question.
+    if current_run and not question and (not due or state["attempts"] + bool(deadline) < 3):
+        if due and deadline:
+            state.update(attempts=state["attempts"] + 1, nextActionAt=None)
+        return "repairing", (f"Waiting for Orbi tick {current_run} to finish before restarting the sandbox"
+                             f" (attempt {state['attempts']} of 3)")
+    # Tick failures are counted on completion, not by looking at the clock again.
+    if cause == "tick:failed" or due or (ask_now and question is None):
+        if deadline and (due or cause == "tick:failed"):
+            state["attempts"] += 1
+        attempt = state["attempts"]
+        if question:
+            wait = WATCH_WAITS[-1]
+        elif ask_now or attempt >= 3:
+            wait = WATCH_WAITS[2]
+            state["question"] = question = watch_question(entry, cause, now, removal_incomplete=bool(
+                state.get("incompleteRecreation") and state["taskState"] == "NotFound"))
+            watch_event(path, state, "question-opened", "ok", attempt)
+        else:
+            wait = WATCH_WAITS[attempt - 1]
+            if repair:
+                # Save the retry budget before acting, just as for a tick request.
+                state.update(at=now.isoformat(), phase="repairing", detail=detail,
+                             nextActionAt=(now + timedelta(seconds=wait)).isoformat())
+                write_state(path, state)
+                if not watch_enabled(path, state):
+                    return "paused", "Deployment is paused"
+                try:
+                    result = repair()
+                except (OSError, ValueError) as exc:
+                    result = str(exc)
+                watch_event(path, state, "repair", result if result is not None else "ok", attempt)
+                if result is not None:
+                    detail = f"{detail} failed: {result}"
+                now = datetime.now(timezone.utc)
+        state["nextActionAt"] = (now + timedelta(seconds=wait)).isoformat()
+    if question:
+        return watch_wait(state, "needs-owner", "Waiting for the owner")
+    if cause == "ax:unreachable":
+        return watch_wait(state, "waiting", detail)
+    return watch_wait(state, "repairing", f"{detail} (attempt {state['attempts']} of 3)")
+
+
+def notify_watch_question(path: Path, state: dict) -> None:
+    question, command = state["question"], state.get("notifyCommand")
+    if not question or not valid_notify_command(command) or question["notifiedAt"] or state["notifyAttempts"] >= 3:
+        return
+    if not watch_enabled(path, state):
+        return
+    # Reserve the attempt durably so restarting watch cannot reset the limit.
+    state["notifyAttempts"] += 1
+    write_state(path, state)
+    env = dict(os.environ, AX_ORBI_DEPLOYMENT=state["deployment"], AX_ORBI_QUESTION_ID=question["id"])
+    try:
+        with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, env=env, text=True, start_new_session=True) as proc:
+            try:
+                proc.communicate(json.dumps(dict(deployment=state["deployment"], question=question)), timeout=30)
+                result = "ok" if proc.returncode == 0 else f"exited {proc.returncode}"
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                result = "timed out after 30s"
+    except (OSError, TypeError, ValueError) as exc:
+        result = str(exc)
+    watch_event(path, state, "notify", result, state["notifyAttempts"])
+    if result == "ok":
+        question["notifiedAt"] = datetime.now(timezone.utc).isoformat()
+        write_state(path, state)
+
+
+def watch_step(entry: dict, state: dict, path: Path) -> tuple[str, str] | None:
     """Observe once, then make at most one change within a 120-second AX budget."""
-    def still_enabled() -> bool:
-        # An operator can pause (including via stop) while the observation is in flight.
-        record = read_desired(path.with_name("desired.json"))
-        state["desired"] = record["mode"] if record is not None else None
-        return state["desired"] == "enabled"
+    cfg = entry["config"]
+    cause = state["cause"]
+    pending = state["pendingTick"]
+    if state["question"] and not (cause == "tick:failed" and pending):
+        if datetime.now(timezone.utc) < datetime.fromisoformat(state["nextActionAt"]):
+            return watch_wait(state, "needs-owner", "Waiting for the owner")
+
+    def activity(phase: str, detail: str) -> tuple[str, str]:
+        # Resume/apply and tick verification take subsequent passes; keep the
+        # active cause until those passes can verify the result.
+        if state["question"]:
+            fresh_start = (phase == "starting"
+                           and (now - datetime.fromisoformat(state["startingSince"])).total_seconds() <= 120)
+            following_up = (phase in ("preparing", "resuming") or fresh_start
+                            or (state["cause"] == "tick:failed" and pending))
+            if not following_up and now >= datetime.fromisoformat(state["nextActionAt"]):
+                # The recheck couldn't verify recovery (for example, another tick is running).
+                state["nextActionAt"] = (now + timedelta(seconds=WATCH_WAITS[-1])).isoformat()
+                return watch_wait(state, "needs-owner", detail)
+            return "needs-owner", detail
+        if state["cause"] not in (None, "ax:unreachable"):
+            return "repairing", f"{detail} (attempt {state['attempts']} of 3)"
+        return phase, detail
 
     # A foreground Ctrl-C should reach watch, not cancel its current AX command.
     ax, task = Ax(cfg, start_new_session=True), names(cfg)["task"]
+
+    def restart() -> str | None:
+        # AX snapshots can take longer than an observation; give suspend the rest of the pass budget.
+        code, out, err = ax.run("suspend", "task", task, timeout=max(0, deadline - time.monotonic()))
+        return None if code == 0 else ((err or out).strip() or f"AX exited {code}")
+
+    def recreate() -> str | None:
+        # Task deletion alone isn't enough: applying over a surviving Workspace
+        # can reuse the old state or fail indefinitely on immutable resources.
+        state["incompleteRecreation"] = dict(cause=state["cause"], since=now.isoformat())
+        write_state(path, state)
+        deleted = Report(as_json=True)
+        delete_sandbox(deleted, ax, cfg, deadline=deadline)
+        if deleted.ok:
+            state["pendingTick"] = None  # The old run records are gone with /workspace.
+            state.pop("incompleteRecreation")
+            return None
+        return "; ".join(check["detail"] for check in deleted.data["checks"] if not check["ok"])
+
+    deadline = time.monotonic() + 120
     observed = ax.task_state(task, timeout=40)
+    now = datetime.now(timezone.utc)
     state["taskState"] = "NotFound" if observed == "" else observed
+    if not watch_enabled(path, state):
+        return None
     kind = TASK_CLASSES.get(observed, "unrecognised")
+    if kind == "unreachable":
+        return watch_failure(entry, state, path, now, "ax:unreachable", "Waiting for AX to answer")
+    if kind in ("failed", "unrecognised"):
+        recreate_allowed = kind == "failed" and cfg["watch"]["recreate_failed"]
+        return watch_failure(entry, state, path, now, f"task:{observed}", "Recreating the sandbox",
+                             repair=recreate if recreate_allowed else None, ask_now=not recreate_allowed)
+
+    if cause == "ax:unreachable" or (cause and cause.startswith("task:") and TASK_CLASSES.get(cause[5:]) != "failed"):
+        clear_watch_cause(path, state)
+    if kind == "missing" and (incomplete := state.get("incompleteRecreation")):
+        recreate_allowed = cfg["watch"]["recreate_failed"]
+        return watch_failure(entry, state, path, now, incomplete["cause"], "Finishing removal of the old sandbox",
+                             repair=recreate if recreate_allowed else None, ask_now=not recreate_allowed)
     if kind in ("missing", "checkpointed"):
         if kind == "missing":
             args, stdin = ("apply", "-f", "-"), render(cfg)
@@ -1149,67 +1388,111 @@ def watch_step(cfg: dict, state: dict, path: Path) -> tuple[str, str] | None:
         else:
             args, stdin = ("resume", "task", task), None
             phase, detail = "resuming", "Restoring the sandbox"
-        if not still_enabled():
-            return None
-        code, out, err = ax.run(*args, stdin=stdin, timeout=80)
-        if code != 0:
-            raise RuntimeError(f"{detail} failed: {(err or out).strip() or f'AX exited {code}'}")
-        return phase, detail
-    if kind == "unreachable":
-        return "waiting", "Waiting for AX to answer"
-    if kind == "transitional":
-        return "waiting", f"Waiting for the sandbox while it is {observed}"
-    if kind == "failed":
-        return "blocked", f"Sandbox task is {observed}"
-    if kind != "active":
-        return "blocked", f"Unrecognised AX state {observed!r}"
 
-    pending = state["pendingTick"]
+        repairing = state["cause"] not in (None, "tick:failed")
+
+        def restore() -> str | None:
+            if repairing:
+                # Wait for the AX state to change before calling apply/resume again.
+                state["repairFollowup"] = dict(kind=kind, since=now.isoformat())
+            try:
+                code, out, err = ax.run(*args, stdin=stdin, timeout=max(0, deadline - time.monotonic()))
+            except (OSError, ValueError) as exc:
+                return str(exc)
+            if code != 0:
+                return (err or out).strip() or f"AX exited {code}"
+            state["startingSince"] = datetime.now(timezone.utc).isoformat() if kind == "checkpointed" else None
+            return None
+
+        if not watch_enabled(path, state):
+            return None
+        followup = state.get("repairFollowup")
+        if followup and followup["kind"] == kind:
+            return watch_failure(entry, state, path, now, state["cause"], detail, repair=restore)
+        result = restore()
+        if result is None:
+            return activity(phase, detail)
+        detail = f"{detail} failed: {result}"
+        if repairing:
+            return activity("waiting", detail)
+        raise RuntimeError(detail)
+    state.pop("repairFollowup", None)
+    if kind == "transitional":
+        return activity("waiting", f"Waiting for the sandbox while it is {observed}")
+
     query = ["--run", pending["id"]] if pending else []
     # --run still returns health and counts (with a nonzero exit) for an unknown ID.
     status, err = ax.agent(task, "status", "--json", *query, timeout=40, allow_status_error=bool(pending))
+    if not watch_enabled(path, state):
+        return None
     now = datetime.now(timezone.utc)
-    if not status or not status.get("started"):
+    status = status or {}
+    alive = status.get("supervisorAlive")
+    current = (status.get("health") or {}).get("currentRun") if alive else None
+    if not status.get("started") or not alive:
         state["startingSince"] = state["startingSince"] or now.isoformat()
-        return "starting", "Waiting for the sandbox agent to start"
+        since = datetime.fromisoformat(state["startingSince"])
+        if not alive and (now - since).total_seconds() > 120:
+            return watch_failure(entry, state, path, now, "agent:down", "Restoring the interrupted worker", repair=restart)
+        return activity("starting", "Waiting for the sandbox agent to start")
     state["startingSince"] = None
+    if state["cause"] == "agent:down":
+        clear_watch_cause(path, state)
     prepare = Report(as_json=True)
-    if not report_prepare(prepare, status, err):
-        failure = next((check["detail"] for check in prepare.data["checks"] if check["ok"] is False),
-                       "prepare checks did not pass")
-        return "blocked", f"Sandbox is not ready: {' '.join(failure.split())}"
-
-    current = (status.get("health") or {}).get("currentRun") if status.get("supervisorAlive") else None
-    if current:
-        return "ticking", f"Orbi tick {current} is running"
-    if (status.get("counts") or {}).get("queued"):
-        return "ticking", "An Orbi tick is queued"
+    ready = report_prepare(prepare, status, err)
+    checks = [check for check in prepare.data["checks"] if check["ok"] is False]
+    if any(check["name"] == "image-pins" for check in checks):
+        return watch_failure(entry, state, path, now, "image-pins", "Image pins do not match", ask_now=True)
+    if state["cause"] == "image-pins":
+        clear_watch_cause(path, state)
+    if not ready:
+        failure = next((check for check in checks if check["name"].startswith("sandbox:")), None)
+        if failure:
+            return watch_failure(entry, state, path, now, failure["name"],
+                                 "Reinstalling the project environment", repair=restart, current_run=current)
+        return activity("waiting", "Waiting for sandbox prepare checks to pass")
+    if state["cause"] != "tick:failed":
+        clear_watch_cause(path, state)
+    state.pop("incompleteRecreation", None)
 
     runs = status.get("runs") or []
     run = runs[0] if pending and runs and runs[0].get("id") == pending["id"] else {}
     if run.get("status") in ("succeeded", "failed", "interrupted"):
-        next_action = now + timedelta(seconds=cfg["watch"]["tick_interval"])
-        state.update(lastTick={key: run.get(key) for key in ("id", "status", "finishedAt")},
-                     pendingTick=None, nextActionAt=next_action.isoformat())
-        return "idle", f"Next tick at {next_action:%H:%M UTC}"
-    if not pending and state["nextActionAt"]:
-        next_action = datetime.fromisoformat(state["nextActionAt"])
-        if now < next_action:
-            return "idle", f"Next tick at {next_action:%H:%M UTC}"
+        state.update(lastTick={key: run.get(key) for key in ("id", "status", "finishedAt")}, pendingTick=None)
+        if run["status"] == "failed":
+            return watch_failure(entry, state, path, now, "tick:failed", "Waiting to retry the failed Orbi tick")
+        if run["status"] == "succeeded":
+            clear_watch_cause(path, state)
+        if state["cause"] == "tick:failed":
+            # An interrupted retry hasn't verified recovery or added a failure.
+            delay = WATCH_WAITS[-1] if state["question"] else WATCH_WAITS[state["attempts"] - 1]
+        else:
+            delay = cfg["watch"]["tick_interval"]
+        state["nextActionAt"] = (now + timedelta(seconds=delay)).isoformat()
+    if current:
+        return activity("ticking", f"Orbi tick {current} is running")
+    if (status.get("counts") or {}).get("queued"):
+        return activity("ticking", "An Orbi tick is queued")
+    if not state["pendingTick"] and state["nextActionAt"]:
+        if now < datetime.fromisoformat(state["nextActionAt"]):
+            if state["cause"] == "tick:failed":
+                phase, detail = activity("idle", "Waiting to retry the failed Orbi tick")
+                return watch_wait(state, phase, detail)
+            deadline = datetime.fromisoformat(state["nextActionAt"])
+            return "idle", f"Next tick at {deadline:%H:%M UTC}"
 
-    if not still_enabled():
-        return None
     if pending is None:
         pending = {"id": f"watch-{now:%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}", "requestedAt": now.isoformat()}
         state["pendingTick"] = pending
-    state.update(at=now.isoformat(), phase="ticking", detail=f"Requesting Orbi tick {pending['id']}")
+    phase, detail = activity("ticking", f"Requesting Orbi tick {pending['id']}")
+    state.update(at=now.isoformat(), phase=phase, detail=detail)
     write_state(path, state)  # Make the id durable even if a prior write failed after rename.
-    if not still_enabled():
+    if not watch_enabled(path, state):
         return None
     answer, err = ax.agent(task, "request-tick", "--id", pending["id"], timeout=40)
     if not answer:
         raise RuntimeError(f"Could not request Orbi tick {pending['id']}: {err}")
-    return "ticking", f"Requested Orbi tick {pending['id']}"
+    return activity("ticking", f"Requested Orbi tick {pending['id']}")
 
 
 def watch_deployment(entry: dict) -> None:
@@ -1218,34 +1501,53 @@ def watch_deployment(entry: dict) -> None:
         return  # Only status reports configurations with no valid identity.
     desired = desired_path(name)
     path = desired.with_name("watch.json")
-    state = dict(desired=None, taskState=None, pendingTick=None, lastTick=None,
-                 nextActionAt=None, startingSince=None)
+    state = dict(desired=None, taskState=None, pendingTick=None, lastTick=None, nextActionAt=None,
+                 startingSince=None, cause=None, attempts=0, question=None, notifyAttempts=0)
     try:
         state.update(read_state(path) or {})
-        state.update(version=1, deployment=name, desired=None, taskState=None)
+        state.update(version=1, deployment=name, desired=None)
         record = read_desired(desired)
-        if record is not None:
-            state["desired"] = record["mode"]
+        state["desired"] = record["mode"] if record is not None else None
         if "configError" in entry:
             phase, detail = "config-error", entry["configError"]
+            if state["desired"] == "enabled" and watch_enabled(path, state):
+                phase, retry = watch_failure(entry, state, path, datetime.now(timezone.utc), "config",
+                                             "Waiting for a corrected config", ask_now=True)
+                detail = f"{detail}; {retry}"
         elif record is None:
             return
         else:
             cfg = entry["config"]
-            if "notify_command" in cfg["watch"]:
-                state["notifyCommand"] = cfg["watch"]["notify_command"]
-            step = watch_step(cfg, state, path) if record["mode"] == "enabled" else None
+            state["notifyCommand"] = cfg["watch"].get("notify_command")
+            if state["desired"] == "enabled":
+                if state["cause"] == "config":
+                    clear_watch_cause(path, state)
+                for field in ("incompleteRecreation", "repairFollowup"):
+                    if ((repair := state.get(field)) and record.get("changedAt")
+                            and record["changedAt"] > repair["since"]):
+                        # A new enable/resume lets the owner finish a repair manually.
+                        state.pop(field)
+                        if field == "incompleteRecreation":
+                            state["pendingTick"] = None
+                        if state["question"]:
+                            state["nextActionAt"] = datetime.now(timezone.utc).isoformat()
+                step = watch_step(entry, state, path)
+            else:
+                step = None
             if state["desired"] is None:
                 return
             phase, detail = step if step is not None else ("paused", "Deployment is paused")
     except Exception as exc:
-        phase, detail = "blocked", str(exc) or type(exc).__name__
+        phase = ("needs-owner" if state["question"] else
+                 "waiting" if state["cause"] in (None, "ax:unreachable") else "repairing")
+        detail = str(exc) or type(exc).__name__
     state.update(version=1, deployment=name, at=datetime.now(timezone.utc).isoformat(),
                  phase=phase, detail=" ".join(detail.split()))
     try:
         write_state(path, state)
+        notify_watch_question(path, state)
     except Exception as exc:
-        print(f"Cannot write watch state for {name}: {exc}", file=sys.stderr)
+        print(f"Cannot save watch state or notify for {name}: {exc}", file=sys.stderr)
 
 
 def cmd_watch(args, report: Report) -> int:
@@ -1282,10 +1584,14 @@ def cmd_watch(args, report: Report) -> int:
             try:
                 fleet = fleet_dir(args.fleet)
                 while not stop:
+                    seen = set()
                     for entry in fleet_entries(fleet, include_config=True):
                         if stop:
                             break
-                        watch_deployment(entry)
+                        # Duplicate names share a config question, including its per-pass notify retry.
+                        if entry["name"] not in seen:
+                            seen.add(entry["name"])
+                            watch_deployment(entry)
                     if args.once:
                         break
                     deadline = time.monotonic() + args.interval
@@ -1313,6 +1619,22 @@ def pause_for_stop(name: str, report: Report) -> bool:
     return True
 
 
+def delete_sandbox(report: Report, ax: Ax, cfg: dict, *, deadline: float | None = None) -> None:
+    for resource, name in names(cfg).items():
+        timeout = 900 if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            report.check(f"delete:{resource}", False, f"did not delete {name} within the watch pass budget")
+            continue
+        code, out, err = ax.run("delete", resource, name, timeout=timeout)
+        # Only AX's resource-level NotFound confirms the resource is already absent.
+        not_found = (f"Error: deleting {resource} {cfg['ax']['atespace']}/{name}: "
+                     f'rpc error: code = NotFound desc = {resource} "{name}" not found in atespace ')
+        absent = code == 1 and any(line.startswith(not_found) for line in err.splitlines())
+        detail = (f"{name} deleted" if code == 0 else f"{name} already absent" if absent
+                  else (err or out).strip() or f"ax delete {resource} exited {code}")
+        report.check(f"delete:{resource}", code == 0 or absent, detail)
+
+
 def cmd_stop(args, report: Report) -> int:
     cfg = load_config(args.config)
     ax, n = Ax(cfg), names(cfg)
@@ -1331,15 +1653,7 @@ def cmd_stop(args, report: Report) -> int:
         report.check("task", None, detail.get(kind, f"{task} reported state {state!r}"))
         if not pause_for_stop(cfg["name"], report):
             return report.finish(EXIT_FAILED)
-        for resource, name in (("task", task), ("workspace", n["workspace"]), ("gateway", n["gateway"])):
-            code, out, err = ax.run("delete", resource, name)
-            # Only AX's resource-level NotFound confirms the resource is already absent.
-            not_found = (f"Error: deleting {resource} {cfg['ax']['atespace']}/{name}: "
-                         f'rpc error: code = NotFound desc = {resource} "{name}" not found in atespace ')
-            absent = code == 1 and any(line.startswith(not_found) for line in err.splitlines())
-            detail = (f"{name} deleted" if code == 0 else f"{name} already absent" if absent
-                      else (err or out).strip() or f"ax delete {resource} exited {code}")
-            report.check(f"delete:{resource}", code == 0 or absent, detail)
+        delete_sandbox(report, ax, cfg)
         return report.finish(EXIT_OK if report.ok else EXIT_FAILED, interruptedRun=None)
     if kind in ("missing", "checkpointed"):
         if not pause_for_stop(cfg["name"], report):
