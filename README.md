@@ -25,6 +25,17 @@ For live AX trials, see the [qualification runbook](docs/QUALIFICATION.md).
 
 GitHub Actions runs offline tests and syntax checks on every push to `main` and every pull request, and runs container verification when image inputs change or on manual dispatch.
 
+## Leave it working
+
+After [configuring AX, the image and Secrets](docs/SETUP.md), register your repository's deployment and check its fleet status. The example name is `demo`:
+
+```sh
+bin/ax-orbi enable --config ./ax-orbi.toml
+bin/ax-orbi status demo
+```
+
+Install the watch service using [Unattended operation](docs/SETUP.md#unattended-operation). It creates or resumes the sandbox and requests ticks without an operator command for each tick. Check status for progress and owner questions; pause the deployment before maintenance. This flow is demonstrated offline, not qualified on live AX.
+
 ## Install the skill
 
 Import or copy the entire [`skills/ax-orbi/`](skills/ax-orbi/) directory into your agent's skills location using its Agent Skills installation instructions. The [operator skill](skills/ax-orbi/SKILL.md) also needs shell access on the AX CLI host and a checkout of this repository; installing the skill doesn't grant AX access. Use the [setup guide](docs/SETUP.md) to configure a deployment.
@@ -43,11 +54,11 @@ Run `bin/ax-orbi --help` for the command list. Every subcommand accepts `--json`
 | `inspect` | Reports sandbox health, recent runs and their evidence. |
 | `stop` | Pauses an enabled deployment and checkpoints the sandbox, keeping state by default. |
 | `recover` | Resumes a checkpointed sandbox and reports interrupted runs. |
-| `enable NAME` or `enable --config PATH` | Installs the pinned AX CLI if needed (only for the default `ax`), starts a local cluster only if AX is unreachable and `[ax] local = true`, and enables the deployment after host checks pass. `--config` also registers the file. `--no-install` skips host preparation and checks. `--build-image` builds and pushes to the default registry (`localhost:5001`) before host setup; the registry must already be reachable. If the digest differs, update `image.ref` yourself and retry. The Go build and Docker local-cluster startup are not yet verified on a live cluster. |
+| `enable NAME` or `enable --config PATH` | Enables a deployment for watch; `--config` also registers the file. By default, prepares the host and checks prerequisites first. `--no-install` skips host preparation and checks; `--build-image` builds and pushes the task image before host setup. |
 | `pause NAME [--reason TEXT]` | Records a pause without changing the AX sandbox. |
 | `resume NAME` | Re-enables a paused deployment without changing the AX sandbox. |
 | `status [NAME]` | Shows fleet modes, watch activity and any open owner question with commands to run, without contacting AX. |
-| `watch [--once] [--interval SECONDS] [--fleet DIR] [--print-unit]` | Keeps enabled deployments ticking and leaves paused ones alone. Routine failures get bounded retries before `needs-owner`; watch then checks for recovery less often. In `[watch]`, `tick_interval` spaces healthy ticks (default 300 seconds, minimum 60), `notify_command` optionally takes an argument list and receives the question as JSON on stdin, and `recreate_failed = true` opts into automatic deletion and recreation of failed sandboxes, including loss of `/workspace`. Watch sleeps 30 seconds after each scan by default; `--once` scans once and `--print-unit` only prints a systemd user unit. |
+| `watch [--once] [--interval SECONDS] [--fleet DIR] [--print-unit]` | Keeps enabled deployments ticking and leaves paused ones alone. Sleeps 30 seconds between scans by default; `--once` scans once and `--print-unit` only prints a systemd user unit. See the [repair policy](docs/SETUP.md#repair-and-retry-policy) for retries and owner questions. |
 
 Exit codes: `0` command succeeded (possibly with warnings), `1` operation, check or tick failed, `2` bad usage or configuration, `3` interrupted, pending or unknown outcome. `check --json` lists warnings in `unverified`; it checks digest syntax (`image-pinned`), not the running image's `image-pins`. See [Interpreting results](docs/SETUP.md#interpreting-results) for the `taskState` classes, pin verification and what `executionUnknown` means after a forced stop.
 
@@ -56,5 +67,5 @@ Exit codes: `0` command succeeded (possibly with warnings), `1` operation, check
 - A tick that exits 0 does **not** mean a delivery merged. It can mean no eligible work was found. Check GitHub for the delivery outcome.
 - Run only **one active Orbi deployment per repository**. Orbi's ownership locks are local files and do not coordinate across sandboxes.
 - The sandbox can still use the full authority of the injected credentials on matching requests. Scope them to the disposable repository and provider account you intend to use.
-- CPU and memory limits do not cap model spending. Use provider-side budgets or quotas.
+- The service does not cap model spending. It requests a tick every `tick_interval` while healthy and idle, subject to the watch scan cadence. Use provider-side budgets or quotas.
 - The Task sets `debug: true` so ax-orbi can reach the agent. Anyone with access to the AX atespace can run commands in the sandbox. Restrict atespace access accordingly.

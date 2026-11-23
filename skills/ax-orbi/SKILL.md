@@ -1,6 +1,6 @@
 ---
 name: ax-orbi
-description: 'Operate Orbi deployments in Google AX sandboxes through bin/ax-orbi. Use when asked to prepare an isolated repository environment, check AX and Orbi health, run or inspect a tick, or stop or recover a deployment.'
+description: 'Operate Orbi deployments in Google AX sandboxes through bin/ax-orbi. Use when asked to enable a repository and keep it working, explain why a deployment is waiting for its owner, pause it, prepare an isolated environment, check health, run or inspect a tick, or stop or recover a deployment.'
 ---
 
 # Operate ax-orbi
@@ -16,6 +16,18 @@ Run from the checkout that contains `bin/ax-orbi`, not the repository being depl
 3. If reusing a deployment name, run `bin/ax-orbi inspect --json` first. Prepare can resume a checkpointed task, and queued requests may run on resume; confirm with the operator before resuming.
 4. Run `bin/ax-orbi prepare --json`, then `bin/ax-orbi inspect --json` to confirm the resulting state. Report the named deployment, what was verified and what still needs attention. Prepare does not request a new tick. Do not request one unless asked.
 
+## “Enable this repository and keep it working”
+
+Confirm the target and pinned image/Secret configuration first. From the checkout, use `bin/ax-orbi enable --json --config ./ax-orbi.toml` to register it, or `bin/ax-orbi enable --json "$NAME"` if registered. This can prepare the host and start local AX if configured; relay failed checks and `fix` text before proceeding. Follow **Unattended operation** in the setup guide to install the systemd user service with the operator's authorization, or verify the intended watch is already running. Check `bin/ax-orbi status --json "$NAME"` for desired mode, phase, freshness and any completed tick. An enabled record alone does not prove watch is running; don't request a manual tick to make it look healthy. Report what was observed and what is still unverified on AX.
+
+## “Why is it waiting on me?”
+
+Run `bin/ax-orbi status --json "$NAME"` first. Report the recorded phase and its age. If `watch.question` is open, show its text and all options with their labels and commands. A question is not authorization to act; do not choose a destructive option without explicit operator instruction. If there is no question, explain the recorded detail and next action time if available, or say that watch activity is unknown.
+
+## “Pause it”
+
+Run `bin/ax-orbi pause --json "$NAME"`, adding `--reason` if the operator supplied one. Verify `desired: paused` with `bin/ax-orbi status --json "$NAME"`; the last watch phase can lag until the next pass. This persists across watch restarts and does not cancel a tick already requested, suspend the sandbox, or delete state.
+
 ## “Check this deployment and explain whether the sandbox is healthy, whether Orbi works, and what needs attention”
 
 Run `bin/ax-orbi check --json` and `bin/ax-orbi inspect --json` for the target. This is a read-only request: do not prepare, resume, or run a tick to prove health. Report separately:
@@ -27,8 +39,8 @@ Run `bin/ax-orbi check --json` and `bin/ax-orbi inspect --json` for the target. 
 ## Tick, stop and recover (when requested)
 
 - `bin/ax-orbi run --json --timeout 120` requests one tick with a 120-second polling budget after the request; startup and in-flight AX calls can take additional time. It can resume a checkpointed task, including previously queued work. A timeout or lost connection does not cancel the tick; inspect before considering another request. Use `run.id` as `RUN_ID` in `bin/ax-orbi inspect --json --run "$RUN_ID" --logs` while the task is `Working`. If no ID was returned, inspect recent runs rather than assuming the request did not reach the task. `run.status` (or `status.runs[].status` in inspect) can be `queued` or `running` (not complete), `succeeded` (tick finished successfully), `failed` (read the detail and log), or `interrupted` (inspect and check GitHub before proceeding). A `succeeded` tick may find no eligible work and **is not a merged delivery**. Check the issue and PR in GitHub for delivery status.
-- `bin/ax-orbi stop --json` checkpoints the sandbox and preserves `/workspace`. It refuses to suspend if it sees a running tick or cannot confirm idleness. Inspect and wait rather than forcing. **Never use `bin/ax-orbi stop --json --force` or `bin/ax-orbi stop --json --delete --yes-delete-state` without the operator's explicit instruction.** A generic stop request or a suggested `fix` is not authorization. Deletion removes the checkout, unpushed work, sessions and run records.
-- `bin/ax-orbi recover --json` resumes a checkpointed deployment. Check `interrupted` for run IDs and inspect their evidence. Interrupted ticks aren't replayed; a later, explicitly requested tick can pick up from GitHub. Already queued requests may run on resume.
+- `bin/ax-orbi stop --json` pauses a fleet-enabled deployment when proceeding to checkpoint the sandbox and preserve `/workspace`. It refuses to suspend if it sees a running tick or cannot confirm idleness. Inspect and wait rather than forcing. **Never use `bin/ax-orbi stop --json --force` or `bin/ax-orbi stop --json --delete --yes-delete-state` without the operator's explicit instruction.** A generic stop request or a suggested `fix` is not authorization. Deletion removes the checkout, unpushed work, sessions and run records.
+- `bin/ax-orbi recover --json` resumes a checkpointed sandbox; it does not re-enable watch for a paused deployment. Check `interrupted` for run IDs and inspect their evidence. Interrupted ticks aren't replayed; a later, explicitly requested tick can pick up from GitHub. Already queued requests may run on resume.
 
 ## Read the JSON result
 

@@ -37,7 +37,14 @@ prefix = "Bearer "                   # Prefix AX adds; the trailing space matter
 [network]
 allow = [] # Additional HTTPS DNS names; GitHub and the model host are already included.
 
-# Optional repository-owned dependency recipe. Package hosts must be in [network] allow.
+# Optional unattended settings, used by the host watch service.
+# [watch]
+# tick_interval = 300 # Seconds after a healthy tick (minimum 60).
+# notify_command = ["/home/operator/bin/notify-orbi"] # Receives an owner question as JSON on stdin.
+# recreate_failed = false # Set true only if automatic deletion of /workspace is acceptable.
+
+# Optional repository-owned dependency recipe. See docs/SETUP.md#unattended-operation.
+# Scripts run from the checkout with the sandbox's credentials and network rules.
 # [project]
 # setup = "scripts/ax-orbi-setup.sh"
 # check = "scripts/ax-orbi-check.sh" # Optional; exit 0 means ready. Without it, setup runs once per start.
@@ -47,6 +54,7 @@ allow = [] # Additional HTTPS DNS names; GitHub and the model host are already i
 atespace = "default" # AX atespace where the manifests are applied.
 bin = "ax"          # AX CLI on PATH, or an explicit path to the binary.
 # context = "ax-local" # Optional explicit Kubernetes context; otherwise use the active one.
+# local = true        # Allow enable to start a local AX cluster if unreachable.
 
 [orbi]
 # Optional Orbi settings. ax-orbi supplies the repository and base branch.

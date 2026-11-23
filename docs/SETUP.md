@@ -105,6 +105,108 @@ bin/ax-orbi recover --json
 
 `recover` resumes the sandbox and reports interrupted run IDs in `interrupted`. Interrupted ticks are kept as evidence, not rerun; the next `bin/ax-orbi run --json` lets Orbi pick up delivery from the GitHub record. Requests that were queued before the stop may run on resume.
 
+## Unattended operation
+
+**Demonstrated offline; not yet qualified on live AX.** Follow the prerequisites and configure the pinned image and Secrets before enabling work. Use one active deployment per repository. From the ax-orbi checkout, register the config (whose `name` is `demo` in this example) and check what watch sees:
+
+```bash
+bin/ax-orbi enable --config ./ax-orbi.toml
+bin/ax-orbi status --json demo
+```
+
+The fleet directory defaults to `${XDG_CONFIG_HOME:-$HOME/.config}/ax-orbi/deployments`. Keep one `*.toml` file or symlink per deployment name there. Registering by path creates a symlink to the config, so keep the original file in place. For an already registered config, use `bin/ax-orbi enable demo`. Fleet commands accept `--fleet DIR`, which takes precedence over `AX_ORBI_FLEET` and the default. Host state defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/ax-orbi` (override with `AX_ORBI_HOME`). This holds `watch.lock` and, under `deployments/<name>/`, `desired.json` (including pauses), `watch.json` (including tick IDs and backoff), and `events.jsonl` (repairs, questions and notifications). Sandbox run evidence lives separately in `/workspace/.ax-orbi`.
+
+By default `enable` checks the host and builds the pinned AX command under the state directory if the default `ax` is missing or doesn't match. It starts a local cluster only if AX is unreachable and `[ax] local = true`; the local startup still needs the tools in [Prerequisites](#prerequisites). To skip installs, cluster startup and host checks on a host you've already prepared, use `bin/ax-orbi enable --no-install demo`. `bin/ax-orbi enable --build-image demo` builds and pushes the image before host setup, so the default registry (`localhost:5001`) must already be reachable. If the pushed digest differs, update `image.ref` and retry; don't overwrite an existing deployment's immutable config. Watch does not install host dependencies or build images.
+
+### Start the user service
+
+On a host with a systemd user manager, generate and install the unit from the checkout you intend to keep:
+
+```bash
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+mkdir -p "$UNIT_DIR" &&
+  bin/ax-orbi watch --print-unit > "$UNIT_DIR/ax-orbi-watch.service" &&
+  timeout 30s systemctl --user daemon-reload &&
+  timeout 30s systemctl --user enable --now ax-orbi-watch.service &&
+  timeout 30s systemctl --user --no-pager status ax-orbi-watch.service
+```
+
+The generated unit uses the absolute path to this checkout. Make sure the user manager can find Python and AX (use an absolute `ax.bin` for a custom AX binary), and sees the same fleet/state directories and AX context as your shell. If you use overrides, set them in the service environment rather than only exporting them in a terminal. To run when logged out or across reboot without logging in, have the host administrator enable lingering for the service account (`loginctl enable-linger USER`). Do not run another watch with the same state directory. For one pass before starting the service, use `bin/ax-orbi watch --once`; it can change enabled sandboxes and request work.
+
+```bash
+bin/ax-orbi status
+bin/ax-orbi pause demo --reason "maintenance"
+bin/ax-orbi status --json demo
+bin/ax-orbi resume demo
+```
+
+Pause persists across service and host restarts. It prevents new watch actions; it does not cancel a tick already requested or suspend the sandbox. `stop` also pauses an enabled deployment before checkpointing it; `recover` alone does not re-enable watch. `resume` re-enables scheduling without acting directly on AX. `status` only reads local state: `desired` is `not-enabled`, `enabled`, or `paused`, and `watch.phase` is the last observed activity, if watch has made a pass. Check `watchAgeSeconds` and the detail before treating it as current.
+
+### Configure tick timing, notifications and the project recipe
+
+```toml
+[watch]
+tick_interval = 300
+# notify_command = ["/home/operator/bin/notify-orbi"]
+recreate_failed = false
+
+[project]
+setup = "scripts/ax-orbi-setup.sh"
+check = "scripts/ax-orbi-check.sh"
+setup_timeout = 1800
+```
+
+- `tick_interval` defaults to 300 seconds (minimum 60). Watch waits this long after observing a successful tick before requesting the next one; the service normally sleeps 30 seconds between fleet passes. This is not a spending cap.
+- `notify_command` is an optional argument array executed directly on the **host**, without a shell. The command receives one JSON object on stdin with `deployment` and `question` (including `id`, `cause`, `text`, `options`, `openedAt` and `notifiedAt`), plus the `AX_ORBI_DEPLOYMENT` and `AX_ORBI_QUESTION_ID` environment variables. Exit 0 marks the question notified; stdout and stderr are discarded. Failures or the 30-second timeout are logged to `events.jsonl` and may be retried on later passes, for at most three attempts per question. Use the question ID (and `openedAt` for a later recurrence) to avoid duplicate alerts if a delivery fails after sending.
+- `recreate_failed` defaults to `false`. Set it to `true` only if watch may delete a failed sandbox and **all of `/workspace`**, including unpushed work and tick evidence.
+- `[project]` is optional. Commit an idempotent `setup` script and, preferably, a quick `check` script that exits 0 only when dependencies are usable. For example, have setup install the repo's locked dependencies and have check verify that the expected executable can run. Paths must resolve to files inside the repository. Scripts run from the checkout with the sandbox's network rules and credentials; include needed package hosts in `[network].allow` and don't put credentials in the recipe.
+- With a check, the agent probes at start and before ticks, runs setup if the check fails, and checks again before running Orbi. Without a check, setup runs once per supervisor start. `setup_timeout` defaults to 1800 seconds (60–7200); each check has a separate 300-second limit. Inspect the prepare checks and `/workspace/.ax-orbi/project-setup.log` if setup fails. Changing the `[project]` table needs a new deployment name because the Task is immutable. Pause and stop the old deployment before enabling the new one.
+
+For a disposable recipe trial, commit these two scripts, then remove the marker
+between ticks to simulate a missing dependency. For a real deployment, replace
+marker creation with the installation step and test actual dependency usability.
+
+```sh
+# scripts/ax-orbi-setup.sh
+set -eu
+mkdir -p .orbi
+: > .orbi/dependency
+```
+
+```sh
+# scripts/ax-orbi-check.sh
+test -f .orbi/dependency
+```
+
+These examples use non-executable script files, which the agent runs with
+`sh`. Give executable scripts a shebang.
+
+### Repair and retry policy
+
+| Observation | What watch does |
+| --- | --- |
+| Task missing or suspended | Applies the deployment or resumes the checkpoint, then waits for readiness. A recorded interrupted tick is kept, not replayed. |
+| AX unreachable | Backs off and checks for AX again; it does not treat the task as missing. |
+| Agent remains down after the 120-second startup window, or sandbox readiness checks fail | Tries to restart by suspending then resuming. It defers restart while a live tick is active. A missing dependency with a working recipe is normally restored by the agent before the next tick. |
+| Tick failed | Backs off and requests a new tick when due. A successful tick closes the question and resets backoff. |
+| Failed AX task (`Failed`, `Cancelled`, `Completed`, `Terminating`) | Asks the owner unless `recreate_failed` explicitly allows bounded deletion and recreation. |
+| Unrecognized AX state, invalid enabled config, or image pin mismatch | Asks the owner immediately. It does not delete for an unrecognized state or rebuild an image. |
+
+For a recurring fault, the first two failures wait 60 and 300 seconds respectively; the third opens one owner question and waits 900 seconds. Later unresolved checks or tick retries use a 30-minute backoff rather than opening another question. Once asking, watch checks for recovery but does not keep attempting sandbox repair indefinitely. A different cause starts a fresh budget. Read the question and its options in `status`; for example, if ticks keep failing, use `bin/ax-orbi inspect --logs` with the correct config, fix the provider or GitHub access, then let watch confirm recovery. Do not follow a destructive option without explicit authorization.
+
+| `watch.phase` | Meaning |
+| --- | --- |
+| `preparing` | Watch applied the missing sandbox resources. |
+| `resuming` | Watch requested restoration of a checkpointed sandbox. |
+| `starting` | Waiting for the supervisor and its startup checks. |
+| `ticking` | A tick was requested, queued or running. |
+| `idle` | The sandbox is ready; waiting until the next tick is due. |
+| `waiting` | No safe changing step now (for example AX is unavailable or transitioning); see `detail`. |
+| `repairing` | A repair is in progress, deferred, or in backoff. |
+| `needs-owner` | An owner question is open; see `watch.question.text` and `watch.question.options`. |
+| `paused` | Watch is leaving the deployment alone. |
+| `config-error` | Watch could not load the config; see the config error. An invalid enabled config may instead be `needs-owner`. |
+
 ## Interpreting results
 
 Exit code `0` means the command succeeded, not necessarily that the sandbox is running or a delivery merged. `1` is a failed operation, check or tick (`check` also uses `1` for invalid config); `2` is bad usage or configuration; `3` means interrupted, still pending or unknown. Read each check's `detail` and `fix` when present. `ok: null` is a warning. `check --json` lists these warning names in `unverified`, even when it exits 0. At the pinned AX revision, `ax-server` remains unverified because AX does not report the server revision. A check skipped with `--offline` is not verified either.
