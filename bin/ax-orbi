@@ -1485,6 +1485,9 @@ def watch_step(entry: dict, state: dict, path: Path) -> tuple[str, str] | None:
         else:
             delay = cfg["watch"]["tick_interval"]
         state["nextActionAt"] = (now + timedelta(seconds=delay)).isoformat()
+        # The agent writes the terminal run record before refreshing health.
+        if current == run["id"]:
+            current = None
     if current:
         return activity("ticking", f"Orbi tick {current} is running")
     if (status.get("counts") or {}).get("queued"):
