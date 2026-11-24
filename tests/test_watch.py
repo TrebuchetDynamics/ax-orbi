@@ -972,6 +972,35 @@ class WatchTests(FleetTestCase):
         sb.wait_status(second, "succeeded")
         self.assertEqual(sb.ticks(), 2)
 
+    def test_terminal_pending_tick_is_not_reported_as_running(self):
+        sb = self.deployment()
+        self.make_ready(sb)
+        run_id = "watch-finished"
+        finished = dict(id=run_id, status="succeeded", finishedAt="2000-01-01T00:01:00+00:00")
+        initial = dict(self.watch_state(), pendingTick=dict(id=run_id, requestedAt="2000-01-01T00:00:00+00:00"))
+        snapshot = dict(sb.status(), runs=[finished])
+
+        for current, phase in ((run_id, "idle"), ("operator", "ticking")):
+            with self.subTest(current=current):
+                self.watch_path().write_text(json.dumps(initial))
+                snapshot["health"]["currentRun"] = current
+                snapshot["counts"] = {"succeeded": 1} if current == run_id else {"succeeded": 1, "running": 1}
+                self.env["FAKE_AX_STATUS"] = json.dumps(snapshot)
+
+                self.watch_once()
+                state = self.status()["watch"]
+                self.assertEqual(state["lastTick"], finished)
+                self.assertIsNone(state["pendingTick"])
+                self.assertEqual(state["phase"], phase, state["detail"])
+                if current == run_id:
+                    self.assertRegex(state["detail"], r"^Next tick at \d\d:\d\d UTC$")
+                else:
+                    self.assertEqual(state["detail"], "Orbi tick operator is running")
+                proc = self.process("status", "demo")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(f'{phase}: {state["detail"]}', proc.stdout)
+                self.assertEqual(self.requests(sb), [])
+
     def test_pending_tick_is_not_started_twice(self):
         sb = self.deployment()
         self.make_ready(sb)
